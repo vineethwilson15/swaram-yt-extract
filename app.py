@@ -179,16 +179,14 @@ async def _download_with_ytdlp(video_id: str) -> str:
         cmd = [
             "yt-dlp",
             "--no-playlist",
-            "-f", "ba*",           # Best audio (includes combined if no audio-only)
-            "-S", "+size,+abr",    # Sort: prefer smallest file size & lowest audio bitrate
+            "-f", "ba/b*",                     # Audio-only first, then any format
+            "-S", "+size,+br,proto:m3u8_native:m3u8:https",  # Smallest + prefer m3u8 (~6MB) over https (~30MB)
+            "--concurrent-fragments", "4",      # Parallel HLS segment downloads
             "--cache-dir", YTDLP_CACHE_DIR,
-            "--js-runtimes", "node",  # Enable node (only deno is on by default in yt-dlp 2026)
-            "--remote-components", "ejs:github",  # Download EJS challenge solver from GitHub
-            "--extractor-args", f"youtubepot-bgutilhttp:base_url={BGUTIL_BASE_URL}",
-            "--max-filesize", str(MAX_FILE_SIZE),
-            "--socket-timeout", "20",
-            "--retries", "2",
-            "--max-downloads", "1",
+            "--js-runtimes", "node",
+            "--remote-components", "ejs:github",
+            "--socket-timeout", "15",
+            "--retries", "1",
             "-o", tmp.name,
             "--force-overwrites",
         ]
@@ -217,8 +215,8 @@ async def _download_with_ytdlp(video_id: str) -> str:
             if "[info]" in line and "format" in line.lower():
                 logger.info(f"[yt-dlp] {line.strip()}")
 
-        # Exit 101 = --max-downloads limit reached (file was downloaded successfully)
-        if proc.returncode not in (0, 101) or (proc.returncode == 101 and not os.path.exists(tmp.name)):
+        # Check yt-dlp exit status
+        if proc.returncode != 0:
             full_err = stderr.decode(errors="replace")
             # Extract actual error/warning lines (skip verbose debug noise)
             err_lines = [l for l in full_err.split("\n")
@@ -246,7 +244,29 @@ async def _download_with_ytdlp(video_id: str) -> str:
         if file_size > MAX_FILE_SIZE:
             raise ValueError(f"File too large ({file_size} bytes)")
 
-        logger.info(f"[yt-dlp] Success: {file_size} bytes ({file_size/1024/1024:.1f} MB) in {elapsed:.1f}s")
+        logger.info(f"[yt-dlp] Downloaded: {file_size/1024/1024:.1f} MB in {elapsed:.1f}s")
+
+        # Strip video track with ffmpeg (YouTube SABR forces combined formats)
+        audio_path = tmp.name + ".audio.m4a"
+        ffmpeg_proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-i", tmp.name, "-vn", "-acodec", "copy", "-y", audio_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(ffmpeg_proc.communicate(), timeout=30)
+
+        if ffmpeg_proc.returncode == 0 and os.path.exists(audio_path):
+            audio_size = os.path.getsize(audio_path)
+            if audio_size >= MIN_AUDIO_BYTES:
+                _safe_unlink(tmp.name)  # Remove large video+audio file
+                logger.info(f"[yt-dlp] Audio extracted: {audio_size/1024/1024:.1f} MB (was {file_size/1024/1024:.1f} MB)")
+                return audio_path
+            else:
+                _safe_unlink(audio_path)
+                logger.warning(f"[ffmpeg] Extracted audio too small ({audio_size} bytes), serving original")
+        else:
+            _safe_unlink(audio_path)
+            logger.warning("[ffmpeg] Audio extraction failed, serving original file")
+
         return tmp.name
 
     except asyncio.TimeoutError:
