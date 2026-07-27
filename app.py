@@ -16,6 +16,7 @@ import asyncio
 import tempfile
 import logging
 import time
+import random
 import base64
 import urllib.request
 import urllib.error
@@ -29,9 +30,17 @@ from fastapi.middleware.cors import CORSMiddleware
 VERSION = "3.0.0"
 MAX_FILE_SIZE = 50 * 1024 * 1024       # 50 MB
 MAX_DURATION_SEC = 600                   # 10 min
-DOWNLOAD_TIMEOUT = 120                   # seconds (includes PO token generation)
+DOWNLOAD_TIMEOUT = max(30, int(os.getenv("DOWNLOAD_TIMEOUT_SEC", "120")))
 MIN_AUDIO_BYTES = 10_000                 # 10 KB
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
+MAX_CONCURRENT_EXTRACTS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTS", "2")))
+YTDLP_MAX_ATTEMPTS = max(1, int(os.getenv("YTDLP_MAX_ATTEMPTS", "3")))
+YTDLP_BACKOFF_BASE_SEC = max(1, int(os.getenv("YTDLP_BACKOFF_BASE_SEC", "5")))
+YTDLP_FRAGMENT_CONCURRENCY = max(1, int(os.getenv("YTDLP_FRAGMENT_CONCURRENCY", "2")))
+PLAYER_CLIENTS = [
+    c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "mweb,web,ios").split(",")
+    if c.strip()
+] or ["mweb"]
 
 # API key shared with HF Spaces backend (set via environment variable)
 API_KEY = os.getenv("API_KEY", "")
@@ -65,6 +74,7 @@ app.add_middleware(
 
 # Track temp files for cleanup
 _active_files: set[str] = set()
+_extract_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTS)
 
 
 @app.on_event("startup")
@@ -167,7 +177,9 @@ async def extract_audio(video_id: str):
 
     tmp_path = None
     try:
-        tmp_path = await _download_with_ytdlp(video_id)
+        # Bound extractor concurrency to avoid burst 429/rate-limit storms.
+        async with _extract_semaphore:
+            tmp_path = await _download_with_ytdlp(video_id)
 
         # Determine media type from extension
         ext = os.path.splitext(tmp_path)[1].lower()
@@ -202,100 +214,146 @@ async def extract_audio(video_id: str):
 # ---------------------------------------------------------------------------
 async def _download_with_ytdlp(video_id: str) -> str:
     """Download audio from YouTube using yt-dlp. Returns path to temp file."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
-    tmp.close()
+    last_error: Exception | None = None
 
-    try:
-        logger.info(f"[yt-dlp] Extracting audio for {video_id}...")
-        t0 = time.time()
+    for attempt in range(1, YTDLP_MAX_ATTEMPTS + 1):
+        tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
+        tmp.close()
+        proc = None
+        player_client = PLAYER_CLIENTS[(attempt - 1) % len(PLAYER_CLIENTS)]
 
-        cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "-f", "ba/b*",                     # Audio-only first, then any format
-            "-S", "+size,+br,proto:m3u8_native:m3u8:https",  # Smallest + prefer m3u8 (~6MB) over https (~30MB)
-            "--concurrent-fragments", "4",      # Parallel HLS segment downloads
-            "--cache-dir", YTDLP_CACHE_DIR,
-            "--js-runtimes", "node",
-            "--remote-components", "ejs:github",
-            "--socket-timeout", "15",
-            "--retries", "1",
-            "--extractor-args", "youtube:player_client=mweb",  # mweb works best with PO tokens
-            "-o", tmp.name,
-            "--force-overwrites",
-        ]
-        # PO tokens: bgutil plugin auto-discovers HTTP server on localhost:4416
-        # Cookies: optional fallback (set YT_COOKIES_B64 env var if needed)
-        if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
-            cmd.extend(["--cookies", YT_COOKIES_FILE])
-            logger.info("[yt-dlp] Using PO tokens + cookies (fallback)")
-        else:
-            logger.info("[yt-dlp] Using PO tokens only (no cookies)")
-        cmd.append(f"https://www.youtube.com/watch?v={video_id}")
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=DOWNLOAD_TIMEOUT
-        )
-
-        elapsed = time.time() - t0
-
-        # Log which format yt-dlp selected (from stderr [info] line)
-        for line in stderr.decode(errors="replace").split("\n"):
-            if "[info]" in line and "format" in line.lower():
-                logger.info(f"[yt-dlp] {line.strip()}")
-
-        # Check yt-dlp exit status
-        if proc.returncode != 0:
-            full_err = stderr.decode(errors="replace")
-            # Extract actual error/warning lines (skip verbose debug noise)
-            err_lines = [l for l in full_err.split("\n")
-                         if l.startswith("ERROR:") or l.startswith("WARNING:") or "Sign in" in l]
-            err_msg = "\n".join(err_lines)[:1000] if err_lines else full_err[-500:]
-            logger.warning(f"[yt-dlp] Failed (exit {proc.returncode}): {err_msg}")
-
-            # Detect specific YouTube errors
-            if "Sign in to confirm" in full_err or "confirm you're not a bot" in full_err.lower():
-                raise HTTPException(503, "YouTube requires login — try again later")
-            if "Video unavailable" in full_err:
-                raise HTTPException(404, "Video not found or unavailable")
-            if "Private video" in full_err:
-                raise HTTPException(403, "This video is private")
-
-            raise ValueError(f"yt-dlp exit {proc.returncode}: {err_msg[:500]}")
-
-        # Validate output file
-        if not os.path.exists(tmp.name):
-            raise ValueError("Downloaded file not found")
-
-        file_size = os.path.getsize(tmp.name)
-        if file_size < MIN_AUDIO_BYTES:
-            raise ValueError(f"File too small ({file_size} bytes)")
-        if file_size > MAX_FILE_SIZE:
-            raise ValueError(f"File too large ({file_size} bytes)")
-
-        logger.info(f"[yt-dlp] Success: {file_size/1024/1024:.1f} MB in {elapsed:.1f}s")
-        return tmp.name
-
-    except asyncio.TimeoutError:
-        logger.warning(f"[yt-dlp] Timed out after {DOWNLOAD_TIMEOUT}s")
         try:
-            proc.kill()
-        except Exception:
-            pass
-        _safe_unlink(tmp.name)
-        raise HTTPException(504, "Download timed out — video may be too long")
-    except (HTTPException, ValueError):
-        _safe_unlink(tmp.name)
-        raise
-    except Exception as e:
-        _safe_unlink(tmp.name)
-        raise ValueError(f"Unexpected error: {e}")
+            logger.info(
+                f"[yt-dlp] Extracting audio for {video_id} (attempt {attempt}/{YTDLP_MAX_ATTEMPTS}, client={player_client})..."
+            )
+            t0 = time.time()
+
+            cmd = [
+                "yt-dlp",
+                "--no-playlist",
+                "-f", "ba/b*",                     # Audio-only first, then any format
+                "-S", "+size,+br,proto:m3u8_native:m3u8:https",  # Smallest + prefer m3u8 (~6MB) over https (~30MB)
+                "--concurrent-fragments", str(YTDLP_FRAGMENT_CONCURRENCY),
+                "--cache-dir", YTDLP_CACHE_DIR,
+                "--js-runtimes", "node",
+                "--remote-components", "ejs:github",
+                "--socket-timeout", "15",
+                "--retries", "1",
+                "--extractor-args", f"youtube:player_client={player_client}",
+                "-o", tmp.name,
+                "--force-overwrites",
+            ]
+            # PO tokens: bgutil plugin auto-discovers HTTP server on localhost:4416
+            # Cookies: optional fallback (set YT_COOKIES_B64 env var if needed)
+            if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
+                cmd.extend(["--cookies", YT_COOKIES_FILE])
+                logger.info("[yt-dlp] Using PO tokens + cookies (fallback)")
+            else:
+                logger.info("[yt-dlp] Using PO tokens only (no cookies)")
+            cmd.append(f"https://www.youtube.com/watch?v={video_id}")
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=DOWNLOAD_TIMEOUT
+            )
+
+            elapsed = time.time() - t0
+
+            # Log which format yt-dlp selected (from stderr [info] line)
+            for line in stderr.decode(errors="replace").split("\n"):
+                if "[info]" in line and "format" in line.lower():
+                    logger.info(f"[yt-dlp] {line.strip()}")
+
+            # Check yt-dlp exit status
+            if proc.returncode != 0:
+                full_err = stderr.decode(errors="replace")
+                # Extract actual error/warning lines (skip verbose debug noise)
+                err_lines = [l for l in full_err.split("\n")
+                             if l.startswith("ERROR:") or l.startswith("WARNING:") or "Sign in" in l]
+                err_msg = "\n".join(err_lines)[:1000] if err_lines else full_err[-500:]
+                logger.warning(f"[yt-dlp] Failed (exit {proc.returncode}): {err_msg}")
+
+                # Detect specific YouTube errors
+                if "Sign in to confirm" in full_err or "confirm you're not a bot" in full_err.lower():
+                    raise HTTPException(503, "YouTube requires login — try again later")
+                if "Video unavailable" in full_err:
+                    raise HTTPException(404, "Video not found or unavailable")
+                if "Private video" in full_err:
+                    raise HTTPException(403, "This video is private")
+
+                raise ValueError(f"yt-dlp exit {proc.returncode}: {err_msg[:500]}")
+
+            # Validate output file
+            if not os.path.exists(tmp.name):
+                raise ValueError("Downloaded file not found")
+
+            file_size = os.path.getsize(tmp.name)
+            if file_size < MIN_AUDIO_BYTES:
+                raise ValueError(f"File too small ({file_size} bytes)")
+            if file_size > MAX_FILE_SIZE:
+                raise ValueError(f"File too large ({file_size} bytes)")
+
+            logger.info(f"[yt-dlp] Success: {file_size/1024/1024:.1f} MB in {elapsed:.1f}s")
+            return tmp.name
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[yt-dlp] Timed out after {DOWNLOAD_TIMEOUT}s")
+            try:
+                if proc:
+                    proc.kill()
+            except Exception:
+                pass
+            _safe_unlink(tmp.name)
+            last_error = HTTPException(504, "Download timed out — video may be too long")
+        except (HTTPException, ValueError) as e:
+            _safe_unlink(tmp.name)
+            last_error = e
+            if isinstance(e, HTTPException) and e.status_code in (403, 404):
+                raise
+        except Exception as e:
+            _safe_unlink(tmp.name)
+            last_error = ValueError(f"Unexpected error: {e}")
+
+        if attempt < YTDLP_MAX_ATTEMPTS and last_error and _is_retryable_error(last_error):
+            backoff = (YTDLP_BACKOFF_BASE_SEC * (2 ** (attempt - 1))) + random.uniform(0, 1.5)
+            logger.warning(
+                f"[yt-dlp] Retrying {video_id} in {backoff:.1f}s due to transient upstream failure"
+            )
+            await asyncio.sleep(backoff)
+            continue
+
+        if last_error:
+            if _is_retryable_error(last_error):
+                raise HTTPException(503, "YouTube is rate-limiting requests — please retry shortly")
+            raise last_error
+
+    raise ValueError("yt-dlp failed with no captured error")
+
+
+def _is_retryable_error(err: Exception) -> bool:
+    """Return True when error likely came from temporary upstream throttling/challenge issues."""
+    if isinstance(err, HTTPException):
+        if err.status_code in (503, 504):
+            return True
+        detail = str(err.detail).lower()
+        return "too many requests" in detail
+
+    msg = str(err).lower()
+    retryable_signatures = [
+        "too many requests",
+        "http error 429",
+        "n challenge",
+        "requested format is not available",
+        "only images are available",
+        "timed out",
+        "unable to download webpage",
+    ]
+    return any(sig in msg for sig in retryable_signatures)
 
 
 # ---------------------------------------------------------------------------
