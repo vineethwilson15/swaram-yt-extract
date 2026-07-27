@@ -164,7 +164,6 @@ async def _run_ytdlp_warmup():
             "--quiet",
             "--cache-dir", YTDLP_CACHE_DIR,
             "--js-runtimes", "node",
-            "--remote-components", "ejs:github",
             "--socket-timeout", "15",
             "--extractor-args", "youtube:player_client=mweb",
         ]
@@ -318,7 +317,6 @@ async def _download_with_ytdlp(video_id: str) -> str:
                 "--concurrent-fragments", str(YTDLP_FRAGMENT_CONCURRENCY),
                 "--cache-dir", YTDLP_CACHE_DIR,
                 "--js-runtimes", "node",
-                "--remote-components", "ejs:github",
                 "--socket-timeout", "15",
                 "--retries", "1",
                 "--extractor-args", f"youtube:player_client={player_client}",

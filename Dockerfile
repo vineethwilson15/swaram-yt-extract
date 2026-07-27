@@ -1,5 +1,5 @@
 # ===== Stage 1: Build bgutil PO Token HTTP server =====
-FROM node:20-bookworm-slim AS bgutil-build
+FROM node:22-bookworm-slim AS bgutil-build
 
 # Clone bgutil-ytdlp-pot-provider at pinned version, install deps, compile TS
 RUN apt-get update && \
@@ -20,11 +20,11 @@ RUN git clone --single-branch --branch 1.3.1 --depth 1 \
 # ===== Stage 2: Final image =====
 FROM python:3.11-slim
 
-# Install ffmpeg + Node.js 20 (EJS solver) + supervisor (dual-process mgmt)
+# Install ffmpeg + Node.js 22 (EJS solver requires Node >= 22.0.0) + supervisor (dual-process mgmt)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ffmpeg curl ca-certificates gnupg supervisor && \
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
