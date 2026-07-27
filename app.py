@@ -34,7 +34,7 @@ DOWNLOAD_TIMEOUT = max(30, int(os.getenv("DOWNLOAD_TIMEOUT_SEC", "120")))
 MIN_AUDIO_BYTES = 10_000                 # 10 KB
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 MAX_CONCURRENT_EXTRACTS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTS", "2")))
-YTDLP_MAX_ATTEMPTS = max(1, int(os.getenv("YTDLP_MAX_ATTEMPTS", "3")))
+YTDLP_MAX_ATTEMPTS = max(1, int(os.getenv("YTDLP_MAX_ATTEMPTS", "4")))
 YTDLP_BACKOFF_BASE_SEC = max(1, int(os.getenv("YTDLP_BACKOFF_BASE_SEC", "5")))
 YTDLP_FRAGMENT_CONCURRENCY = max(1, int(os.getenv("YTDLP_FRAGMENT_CONCURRENCY", "2")))
 PLAYER_CLIENTS = [
@@ -51,6 +51,12 @@ PROXY_URLS = [
     p.strip() for p in os.getenv("YTDLP_PROXY_URL", "").split(",")
     if p.strip()
 ]
+
+# Pre-warm the EJS/nsig challenge-solver into --cache-dir at startup so a fresh
+# container (Render free tier restarts often) doesn't pay for a cold-cache
+# component fetch (and possible failure) on the first real user request.
+YTDLP_WARMUP_ENABLED = os.getenv("YTDLP_WARMUP_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+YTDLP_WARMUP_VIDEO_ID = os.getenv("YTDLP_WARMUP_VIDEO_ID", "jNQXAC9IVRw")
 
 # API key shared with HF Spaces backend (set via environment variable)
 API_KEY = os.getenv("API_KEY", "")
@@ -132,6 +138,54 @@ def _check_bgutil_server():
         logger.info(f"bgutil PO token server reachable on {BGUTIL_SERVER_URL}")
     except Exception:
         logger.info(f"bgutil PO token server not yet reachable — supervisord will start it")
+
+
+@app.on_event("startup")
+async def _warm_ytdlp_cache():
+    """Kick off a background task to pre-fetch the EJS/nsig solver into --cache-dir.
+
+    Runs asynchronously — does not block startup or health checks. Tries each
+    configured proxy (or direct if none) until one succeeds, using --simulate so
+    no media is actually downloaded.
+    """
+    if not YTDLP_WARMUP_ENABLED:
+        return
+    asyncio.create_task(_run_ytdlp_warmup())
+
+
+async def _run_ytdlp_warmup():
+    proxy_candidates = list(PROXY_URLS) if PROXY_URLS else [None]
+    for proxy_url in proxy_candidates:
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--simulate",
+            "--skip-download",
+            "--quiet",
+            "--cache-dir", YTDLP_CACHE_DIR,
+            "--js-runtimes", "node",
+            "--remote-components", "ejs:github",
+            "--socket-timeout", "15",
+            "--extractor-args", "youtube:player_client=mweb",
+        ]
+        if proxy_url:
+            cmd.extend(["--proxy", proxy_url])
+        cmd.append(f"https://www.youtube.com/watch?v={YTDLP_WARMUP_VIDEO_ID}")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+            if proc.returncode == 0:
+                logger.info(f"[warmup] EJS solver cache primed (proxy={_mask_proxy(proxy_url)})")
+                return
+            logger.warning(
+                f"[warmup] attempt failed (proxy={_mask_proxy(proxy_url)}): "
+                f"{stderr.decode(errors='replace')[-300:]}"
+            )
+        except Exception as e:
+            logger.warning(f"[warmup] attempt errored (proxy={_mask_proxy(proxy_url)}): {e}")
+    logger.warning("[warmup] could not prime EJS solver cache — first real request may hit a cold-cache failure")
 
 
 # ---------------------------------------------------------------------------
