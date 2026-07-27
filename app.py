@@ -57,6 +57,17 @@ PROXY_URLS = [
 # component fetch (and possible failure) on the first real user request.
 YTDLP_WARMUP_ENABLED = os.getenv("YTDLP_WARMUP_ENABLED", "true").strip().lower() not in ("false", "0", "no")
 YTDLP_WARMUP_VIDEO_ID = os.getenv("YTDLP_WARMUP_VIDEO_ID", "jNQXAC9IVRw")
+# Cap how many proxies the warmup task will cycle through — it only needs ONE
+# success to prime the nsig cache, so trying all configured proxies on every
+# cold start just burns proxy bandwidth quota for no extra benefit.
+YTDLP_WARMUP_MAX_PROXIES = max(1, int(os.getenv("YTDLP_WARMUP_MAX_PROXIES", "2")))
+
+# Try a direct (no-proxy) connection on the first attempt before falling back
+# to the proxy rotation. Proxy bandwidth (esp. free tiers) is a limited/costly
+# resource — the audio download itself is the expensive part. If YouTube's
+# IP-level block on this host isn't 100% consistent, this avoids spending any
+# proxy quota at all on requests that would have succeeded directly anyway.
+YTDLP_TRY_DIRECT_FIRST = os.getenv("YTDLP_TRY_DIRECT_FIRST", "true").strip().lower() not in ("false", "0", "no")
 
 # API key shared with HF Spaces backend (set via environment variable)
 API_KEY = os.getenv("API_KEY", "")
@@ -154,7 +165,10 @@ async def _warm_ytdlp_cache():
 
 
 async def _run_ytdlp_warmup():
-    proxy_candidates = list(PROXY_URLS) if PROXY_URLS else [None]
+    proxy_candidates = (
+        random.sample(PROXY_URLS, k=min(len(PROXY_URLS), YTDLP_WARMUP_MAX_PROXIES))
+        if PROXY_URLS else [None]
+    )
     for proxy_url in proxy_candidates:
         cmd = [
             "yt-dlp",
@@ -290,9 +304,13 @@ async def _download_with_ytdlp(video_id: str) -> str:
 
     # Shuffle proxies once per request so each retry attempt tries a different
     # one (up to the number available) instead of repeating a failed proxy.
+    # If YTDLP_TRY_DIRECT_FIRST is on, the first attempt is reserved for a
+    # direct (no-proxy) connection, so only remaining attempts need a proxy.
+    direct_first = YTDLP_TRY_DIRECT_FIRST and bool(PROXY_URLS)
+    proxy_attempt_budget = max(0, YTDLP_MAX_ATTEMPTS - 1) if direct_first else YTDLP_MAX_ATTEMPTS
     proxy_sequence = (
-        random.sample(PROXY_URLS, k=min(len(PROXY_URLS), YTDLP_MAX_ATTEMPTS))
-        if PROXY_URLS else []
+        random.sample(PROXY_URLS, k=min(len(PROXY_URLS), proxy_attempt_budget))
+        if PROXY_URLS and proxy_attempt_budget else []
     )
 
     for attempt in range(1, YTDLP_MAX_ATTEMPTS + 1):
@@ -300,7 +318,11 @@ async def _download_with_ytdlp(video_id: str) -> str:
         tmp.close()
         proc = None
         player_client = PLAYER_CLIENTS[(attempt - 1) % len(PLAYER_CLIENTS)]
-        proxy_url = proxy_sequence[(attempt - 1) % len(proxy_sequence)] if proxy_sequence else None
+        if direct_first and attempt == 1:
+            proxy_url = None  # try direct first to avoid spending proxy bandwidth quota
+        else:
+            proxy_idx = (attempt - 2) if direct_first else (attempt - 1)
+            proxy_url = proxy_sequence[proxy_idx % len(proxy_sequence)] if proxy_sequence else None
 
         try:
             logger.info(
