@@ -42,6 +42,16 @@ PLAYER_CLIENTS = [
     if c.strip()
 ] or ["mweb"]
 
+# Optional proxy(ies) for yt-dlp requests (residential/rotating proxy recommended).
+# Mitigates IP-level 429 throttling from YouTube that cookies/PO tokens cannot fix.
+# Accepts one or more comma-separated proxy URLs:
+#   YTDLP_PROXY_URL=http://user:pass@host1:port,http://user:pass@host2:port
+# Format per entry: http://user:pass@host:port or socks5://host:port. No-op if unset.
+PROXY_URLS = [
+    p.strip() for p in os.getenv("YTDLP_PROXY_URL", "").split(",")
+    if p.strip()
+]
+
 # API key shared with HF Spaces backend (set via environment variable)
 API_KEY = os.getenv("API_KEY", "")
 
@@ -96,6 +106,15 @@ def _init_cookies():
         logger.info(f"YouTube cookies loaded as fallback ({len(cookies_bytes)} bytes)")
     except Exception as e:
         logger.error(f"Failed to decode YT_COOKIES_B64: {e}")
+
+
+@app.on_event("startup")
+def _log_proxy_status():
+    """Log whether yt-dlp proxies are configured (without leaking credentials)."""
+    if PROXY_URLS:
+        logger.info(f"yt-dlp proxy rotation enabled ({len(PROXY_URLS)} proxies configured)")
+    else:
+        logger.info("YTDLP_PROXY_URL not set — requests go direct from this host's IP")
 
 
 BGUTIL_SERVER_URL = "http://127.0.0.1:4416"
@@ -216,15 +235,24 @@ async def _download_with_ytdlp(video_id: str) -> str:
     """Download audio from YouTube using yt-dlp. Returns path to temp file."""
     last_error: Exception | None = None
 
+    # Shuffle proxies once per request so each retry attempt tries a different
+    # one (up to the number available) instead of repeating a failed proxy.
+    proxy_sequence = (
+        random.sample(PROXY_URLS, k=min(len(PROXY_URLS), YTDLP_MAX_ATTEMPTS))
+        if PROXY_URLS else []
+    )
+
     for attempt in range(1, YTDLP_MAX_ATTEMPTS + 1):
         tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
         tmp.close()
         proc = None
         player_client = PLAYER_CLIENTS[(attempt - 1) % len(PLAYER_CLIENTS)]
+        proxy_url = proxy_sequence[(attempt - 1) % len(proxy_sequence)] if proxy_sequence else None
 
         try:
             logger.info(
-                f"[yt-dlp] Extracting audio for {video_id} (attempt {attempt}/{YTDLP_MAX_ATTEMPTS}, client={player_client})..."
+                f"[yt-dlp] Extracting audio for {video_id} (attempt {attempt}/{YTDLP_MAX_ATTEMPTS}, "
+                f"client={player_client}, proxy={_mask_proxy(proxy_url)})..."
             )
             t0 = time.time()
 
@@ -250,6 +278,10 @@ async def _download_with_ytdlp(video_id: str) -> str:
                 logger.info("[yt-dlp] Using PO tokens + cookies (fallback)")
             else:
                 logger.info("[yt-dlp] Using PO tokens only (no cookies)")
+            # Proxy: routes yt-dlp traffic through a rotating proxy to avoid
+            # IP-level 429 throttling on this host's outbound IP.
+            if proxy_url:
+                cmd.extend(["--proxy", proxy_url])
             cmd.append(f"https://www.youtube.com/watch?v={video_id}")
 
             proc = await asyncio.create_subprocess_exec(
@@ -333,6 +365,17 @@ async def _download_with_ytdlp(video_id: str) -> str:
             raise last_error
 
     raise ValueError("yt-dlp failed with no captured error")
+
+
+def _mask_proxy(proxy_url: str | None) -> str:
+    """Return a credential-free representation of a proxy URL for logging."""
+    if not proxy_url:
+        return "none"
+    if "@" in proxy_url:
+        scheme_part, host_part = proxy_url.split("@", 1)
+        scheme = scheme_part.split("://", 1)[0] if "://" in scheme_part else "proxy"
+        return f"{scheme}://***@{host_part}"
+    return proxy_url
 
 
 def _is_retryable_error(err: Exception) -> bool:
