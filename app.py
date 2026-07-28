@@ -176,6 +176,7 @@ async def _run_ytdlp_warmup():
             "--simulate",
             "--skip-download",
             "--quiet",
+            "--force-ipv4",
             "--cache-dir", YTDLP_CACHE_DIR,
             "--js-runtimes", "node",
             "--socket-timeout", "15",
@@ -336,6 +337,7 @@ async def _download_with_ytdlp(video_id: str) -> str:
                 "--no-playlist",
                 "-f", "ba/b*",                     # Audio-only first, then any format
                 "-S", "+size,+br,proto:m3u8_native:m3u8:https",  # Smallest + prefer m3u8 (~6MB) over https (~30MB)
+                "--force-ipv4",
                 "--concurrent-fragments", str(YTDLP_FRAGMENT_CONCURRENCY),
                 "--cache-dir", YTDLP_CACHE_DIR,
                 "--js-runtimes", "node",
@@ -469,6 +471,8 @@ def _is_retryable_error(err: Exception) -> bool:
         "only images are available",
         "timed out",
         "unable to download webpage",
+        "network is unreachable",
+        "failed to establish a new connection",
     ]
     return any(sig in msg for sig in retryable_signatures)
 
