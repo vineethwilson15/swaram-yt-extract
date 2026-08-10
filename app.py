@@ -20,7 +20,8 @@ import random
 import base64
 import urllib.request
 import urllib.error
-from fastapi import FastAPI, HTTPException, Depends, Header
+from collections import OrderedDict
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -82,6 +83,93 @@ YTDLP_CACHE_DIR = "/app/.ytdlp-cache"
 YT_COOKIES_FILE = None  # Set at startup if cookies are available
 
 # ---------------------------------------------------------------------------
+# Server-side LRU cache for extracted audio files
+# ---------------------------------------------------------------------------
+class FileCache:
+    """In-memory LRU cache for extracted audio files keyed by video_id."""
+
+    def __init__(self, ttl_sec: int = 3600, max_size: int = 50):
+        self.ttl_sec = ttl_sec
+        self.max_size = max_size
+        self._cache: OrderedDict[str, dict] = OrderedDict()
+
+    def get(self, video_id: str) -> str | None:
+        if video_id not in self._cache:
+            return None
+        entry = self._cache[video_id]
+        if time.time() > entry["expires"] or not os.path.exists(entry["path"]):
+            self._remove(video_id)
+            return None
+        self._cache.move_to_end(video_id)
+        return entry["path"]
+
+    def put(self, video_id: str, path: str):
+        if video_id in self._cache:
+            self._remove(video_id)
+        self._cache[video_id] = {"path": path, "expires": time.time() + self.ttl_sec}
+        while len(self._cache) > self.max_size:
+            self._remove(next(iter(self._cache)))
+
+    def _remove(self, video_id: str):
+        entry = self._cache.pop(video_id, None)
+        if entry and os.path.exists(entry["path"]):
+            try:
+                os.unlink(entry["path"])
+            except OSError:
+                pass
+
+    def cleanup_expired(self):
+        now = time.time()
+        for vid in list(self._cache.keys()):
+            if now > self._cache[vid]["expires"]:
+                self._remove(vid)
+
+
+file_cache = FileCache(
+    ttl_sec=int(os.getenv("CACHE_TTL_SEC", "3600")),
+    max_size=int(os.getenv("CACHE_MAX_SIZE", "50")),
+)
+
+
+# ---------------------------------------------------------------------------
+# Simple in-memory rate limiter
+# ---------------------------------------------------------------------------
+class SimpleRateLimiter:
+    """Sliding-window rate limiter keyed by client IP."""
+
+    def __init__(self, max_requests: int = 20, window_sec: int = 60):
+        self.max_requests = max_requests
+        self.window_sec = window_sec
+        self._history: dict[str, list[float]] = {}
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.time()
+        if key not in self._history:
+            self._history[key] = []
+        cutoff = now - self.window_sec
+        self._history[key] = [t for t in self._history[key] if t > cutoff]
+        if len(self._history[key]) >= self.max_requests:
+            return False
+        self._history[key].append(now)
+        return True
+
+
+rate_limiter = SimpleRateLimiter(
+    max_requests=int(os.getenv("RATE_LIMIT_MAX", "20")),
+    window_sec=int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60")),
+)
+
+
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
@@ -99,9 +187,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Track temp files for cleanup
-_active_files: set[str] = set()
+# Track extractor concurrency
 _extract_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTS)
+
+
+@app.on_event("startup")
+async def _start_cache_cleanup():
+    """Periodically clean expired entries from the file cache."""
+    async def _cleanup_loop():
+        while True:
+            await asyncio.sleep(300)
+            file_cache.cleanup_expired()
+    asyncio.create_task(_cleanup_loop())
 
 
 @app.on_event("startup")
@@ -243,7 +340,7 @@ async def health():
 
 
 @app.get("/extract", dependencies=[Depends(verify_api_key)])
-async def extract_audio(video_id: str):
+async def extract_audio(video_id: str, request: Request):
     """
     Extract audio from a YouTube video and return the file.
 
@@ -256,11 +353,38 @@ async def extract_audio(video_id: str):
     Security:
         - Only accepts validated 11-char video IDs (no arbitrary URL injection)
         - Optional API key auth via X-API-Key header
-        - Max duration 10 min, max file size 30 MB
+        - Max duration 10 min, max file size 50 MB
     """
     # Validate video ID (SSRF protection — only IDs, never URLs)
     if not video_id or not YT_VIDEO_ID_RE.match(video_id):
         raise HTTPException(400, "Invalid video_id — must be 11 alphanumeric chars")
+
+    # Rate limiting (per client IP, with X-Forwarded-For support)
+    client_ip = _get_client_ip(request)
+    if not rate_limiter.is_allowed(client_ip):
+        raise HTTPException(429, "Rate limit exceeded — please retry later")
+
+    media_types = {
+        ".m4a": "audio/mp4",
+        ".webm": "audio/webm",
+        ".opus": "audio/opus",
+        ".mp3": "audio/mpeg",
+        ".ogg": "audio/ogg",
+    }
+
+    # Check server-side cache first
+    cached_path = file_cache.get(video_id)
+    if cached_path and os.path.exists(cached_path):
+        ext = os.path.splitext(cached_path)[1].lower()
+        media_type = media_types.get(ext, "audio/mp4")
+        size_mb = os.path.getsize(cached_path) / 1024 / 1024
+        logger.info(f"[cache] HIT {video_id} ({size_mb:.1f} MB)")
+        return FileResponse(
+            path=cached_path,
+            media_type=media_type,
+            filename=f"{video_id}{ext}",
+            headers={"Cache-Control": "public, max-age=1800"},
+        )
 
     tmp_path = None
     try:
@@ -268,24 +392,20 @@ async def extract_audio(video_id: str):
         async with _extract_semaphore:
             tmp_path = await _download_with_ytdlp(video_id)
 
-        # Determine media type from extension
         ext = os.path.splitext(tmp_path)[1].lower()
-        media_types = {
-            ".m4a": "audio/mp4",
-            ".webm": "audio/webm",
-            ".opus": "audio/opus",
-            ".mp3": "audio/mpeg",
-            ".ogg": "audio/ogg",
-        }
         media_type = media_types.get(ext, "audio/mp4")
 
-        _active_files.add(tmp_path)
+        # Cache the file for subsequent requests
+        file_cache.put(video_id, tmp_path)
+
+        size_mb = os.path.getsize(tmp_path) / 1024 / 1024
+        logger.info(f"[cache] MISS {video_id} ({size_mb:.1f} MB) — cached for {file_cache.ttl_sec}s")
 
         return FileResponse(
             path=tmp_path,
             media_type=media_type,
             filename=f"{video_id}{ext}",
-            background=_cleanup_task(tmp_path),
+            headers={"Cache-Control": "public, max-age=1800"},
         )
     except HTTPException:
         _safe_unlink(tmp_path)
@@ -484,15 +604,5 @@ def _safe_unlink(path: str | None):
     if path:
         try:
             os.unlink(path)
-            _active_files.discard(path)
         except OSError:
             pass
-
-
-class _cleanup_task:
-    """Starlette BackgroundTask-compatible callable for file cleanup."""
-    def __init__(self, path: str):
-        self.path = path
-
-    async def __call__(self):
-        _safe_unlink(self.path)
