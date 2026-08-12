@@ -43,6 +43,28 @@ PLAYER_CLIENTS = [
     if c.strip()
 ] or ["mweb"]
 
+# Clients that do NOT support cookies. When cookies are loaded, these clients
+# are silently skipped by yt-dlp and waste a retry attempt. We keep them in
+# the default list for cookie-less operation, but dynamically reorder/exclude
+# them at request time based on cookie availability.
+_NON_COOKIE_CLIENTS = {"ios", "android"}
+
+
+def _effective_player_clients() -> list[str]:
+    """Return player clients ordered by suitability for the current cookie state.
+
+    - Cookies loaded: cookie-compatible clients first, non-cookie clients last.
+    - No cookies: default order from PLAYER_CLIENTS.
+    """
+    if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
+        compatible = [c for c in PLAYER_CLIENTS if c not in _NON_COOKIE_CLIENTS]
+        incompatible = [c for c in PLAYER_CLIENTS if c in _NON_COOKIE_CLIENTS]
+        result = compatible + incompatible
+        if not result:
+            return ["mweb"]
+        return result
+    return PLAYER_CLIENTS
+
 # Optional proxy(ies) for yt-dlp requests (residential/rotating proxy recommended).
 # Mitigates IP-level 429 throttling from YouTube that cookies/PO tokens cannot fix.
 # Accepts one or more comma-separated proxy URLs:
@@ -460,7 +482,8 @@ async def _download_with_ytdlp(video_id: str) -> str:
         tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
         tmp.close()
         proc = None
-        player_client = PLAYER_CLIENTS[(attempt - 1) % len(PLAYER_CLIENTS)]
+        effective_clients = _effective_player_clients()
+        player_client = effective_clients[(attempt - 1) % len(effective_clients)]
         if direct_first and attempt == 1:
             proxy_url = None  # try direct first to avoid spending proxy bandwidth quota
         else:
