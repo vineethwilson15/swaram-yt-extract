@@ -39,7 +39,7 @@ YTDLP_MAX_ATTEMPTS = max(1, int(os.getenv("YTDLP_MAX_ATTEMPTS", "4")))
 YTDLP_BACKOFF_BASE_SEC = max(1, int(os.getenv("YTDLP_BACKOFF_BASE_SEC", "5")))
 YTDLP_FRAGMENT_CONCURRENCY = max(1, int(os.getenv("YTDLP_FRAGMENT_CONCURRENCY", "2")))
 PLAYER_CLIENTS = [
-    c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "mweb,web,ios").split(",")
+    c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "mweb,web,ios,android,mediaconnect").split(",")
     if c.strip()
 ] or ["mweb"]
 
@@ -189,6 +189,28 @@ app.add_middleware(
 
 # Track extractor concurrency
 _extract_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTS)
+
+
+@app.on_event("startup")
+def _clear_ytdlp_cache():
+    """Clear yt-dlp cache on startup to avoid stale player/signature data causing 403s."""
+    if not os.path.isdir(YTDLP_CACHE_DIR):
+        return
+    cleared = 0
+    for entry in os.listdir(YTDLP_CACHE_DIR):
+        entry_path = os.path.join(YTDLP_CACHE_DIR, entry)
+        try:
+            if os.path.isfile(entry_path):
+                os.unlink(entry_path)
+                cleared += 1
+            elif os.path.isdir(entry_path):
+                import shutil
+                shutil.rmtree(entry_path)
+                cleared += 1
+        except OSError:
+            pass
+    if cleared:
+        logger.info(f"[startup] Cleared yt-dlp cache dir ({cleared} items)")
 
 
 @app.on_event("startup")
@@ -594,6 +616,10 @@ def _is_retryable_error(err: Exception) -> bool:
         "network is unreachable",
         "failed to establish a new connection",
     ]
+    # 403 during media download is usually an IP/geo block; retry only if we have
+    # proxies configured, otherwise retrying is pointless.
+    if PROXY_URLS and "http error 403" in msg:
+        return True
     return any(sig in msg for sig in retryable_signatures)
 
 
