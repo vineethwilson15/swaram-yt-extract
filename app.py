@@ -90,13 +90,18 @@ YTDLP_WARMUP_MAX_PROXIES = max(1, int(os.getenv("YTDLP_WARMUP_MAX_PROXIES", "2")
 # resource — the audio download itself is the expensive part. If YouTube's
 # IP-level block on this host isn't 100% consistent, this avoids spending any
 # proxy quota at all on requests that would have succeeded directly anyway.
-YTDLP_TRY_DIRECT_FIRST = os.getenv("YTDLP_TRY_DIRECT_FIRST", "true").strip().lower() not in ("false", "0", "no")
+YTDLP_TRY_DIRECT_FIRST = os.getenv("YTDLP_TRY_DIRECT_FIRST", "false").strip().lower() not in ("false", "0", "no")
 
 # API key shared with HF Spaces backend (set via environment variable)
 API_KEY = os.getenv("API_KEY", "")
 
 # yt-dlp cache directory — stores nsig cache, EJS solver, etc.
 YTDLP_CACHE_DIR = "/app/.ytdlp-cache"
+
+# Persistent directory for cached extracted audio files.
+# Defaults to a subdirectory of YTDLP_CACHE_DIR so it survives container
+# warmup cache clears and OS tmp cleanup between requests.
+YTDLP_FILE_CACHE_DIR = os.getenv("YTDLP_FILE_CACHE_DIR", os.path.join(YTDLP_CACHE_DIR, "files"))
 
 # YouTube cookies — optional fallback for cloud IP extraction.
 # PO tokens (via bgutil server on localhost:4416) are the primary auth method.
@@ -215,11 +220,17 @@ _extract_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTS)
 
 @app.on_event("startup")
 def _clear_ytdlp_cache():
-    """Clear yt-dlp cache on startup to avoid stale player/signature data causing 403s."""
+    """Clear yt-dlp cache on startup to avoid stale player/signature data causing 403s.
+
+    Preserves the file cache directory so previously extracted audio files
+    remain available across container restarts.
+    """
     if not os.path.isdir(YTDLP_CACHE_DIR):
         return
     cleared = 0
     for entry in os.listdir(YTDLP_CACHE_DIR):
+        if entry == "files":
+            continue
         entry_path = os.path.join(YTDLP_CACHE_DIR, entry)
         try:
             if os.path.isfile(entry_path):
@@ -233,6 +244,12 @@ def _clear_ytdlp_cache():
             pass
     if cleared:
         logger.info(f"[startup] Cleared yt-dlp cache dir ({cleared} items)")
+
+
+@app.on_event("startup")
+def _ensure_cache_dirs():
+    """Ensure persistent file cache directory exists."""
+    os.makedirs(YTDLP_FILE_CACHE_DIR, exist_ok=True)
 
 
 @app.on_event("startup")
@@ -479,7 +496,7 @@ async def _download_with_ytdlp(video_id: str) -> str:
     )
 
     for attempt in range(1, YTDLP_MAX_ATTEMPTS + 1):
-        tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
+        tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False, dir=YTDLP_FILE_CACHE_DIR)
         tmp.close()
         proc = None
         effective_clients = _effective_player_clients()
