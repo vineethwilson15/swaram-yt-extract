@@ -24,6 +24,7 @@ from collections import OrderedDict
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 
 # ---------------------------------------------------------------------------
 # Config
@@ -34,7 +35,7 @@ MAX_DURATION_SEC = 600                   # 10 min
 DOWNLOAD_TIMEOUT = max(30, int(os.getenv("DOWNLOAD_TIMEOUT_SEC", "120")))
 MIN_AUDIO_BYTES = 10_000                 # 10 KB
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
-MAX_CONCURRENT_EXTRACTS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTS", "2")))
+MAX_CONCURRENT_EXTRACTS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTS", "1")))
 YTDLP_MAX_ATTEMPTS = max(1, int(os.getenv("YTDLP_MAX_ATTEMPTS", "4")))
 YTDLP_BACKOFF_BASE_SEC = max(1, int(os.getenv("YTDLP_BACKOFF_BASE_SEC", "5")))
 YTDLP_FRAGMENT_CONCURRENCY = max(1, int(os.getenv("YTDLP_FRAGMENT_CONCURRENCY", "2")))
@@ -153,8 +154,8 @@ class FileCache:
 
 
 file_cache = FileCache(
-    ttl_sec=int(os.getenv("CACHE_TTL_SEC", "3600")),
-    max_size=int(os.getenv("CACHE_MAX_SIZE", "50")),
+    ttl_sec=int(os.getenv("CACHE_TTL_SEC", "7200")),
+    max_size=int(os.getenv("CACHE_MAX_SIZE", "100")),
 )
 
 
@@ -213,6 +214,42 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+class BandwidthTrackerMiddleware:
+    """Log bytes served per /extract request for egress monitoring."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        bytes_sent = 0
+        status_code = 0
+
+        async def send_with_tracking(message):
+            nonlocal bytes_sent, status_code
+            if message["type"] == "http.response.start":
+                status_code = message.get("status", 0)
+            elif message["type"] == "http.response.body":
+                body = message.get("body", b"")
+                bytes_sent += len(body)
+            await send(message)
+
+        await self.app(scope, receive, send_with_tracking)
+
+        path = scope.get("path", "/")
+        if path == "/extract" and status_code == 200:
+            logger.info(
+                f"[bandwidth] served {bytes_sent} bytes ({bytes_sent / 1024 / 1024:.2f} MB)"
+            )
+
+
+app.add_middleware(BandwidthTrackerMiddleware)
 
 # Track extractor concurrency
 _extract_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTS)
