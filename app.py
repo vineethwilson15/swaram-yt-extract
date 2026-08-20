@@ -79,7 +79,7 @@ PROXY_URLS = [
 # Pre-warm the EJS/nsig challenge-solver into --cache-dir at startup so a fresh
 # container (Render free tier restarts often) doesn't pay for a cold-cache
 # component fetch (and possible failure) on the first real user request.
-YTDLP_WARMUP_ENABLED = os.getenv("YTDLP_WARMUP_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+YTDLP_WARMUP_ENABLED = os.getenv("YTDLP_WARMUP_ENABLED", "false").strip().lower() not in ("false", "0", "no")
 YTDLP_WARMUP_VIDEO_ID = os.getenv("YTDLP_WARMUP_VIDEO_ID", "jNQXAC9IVRw")
 # Cap how many proxies the warmup task will cycle through — it only needs ONE
 # success to prime the nsig cache, so trying all configured proxies on every
