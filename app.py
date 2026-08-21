@@ -40,7 +40,7 @@ YTDLP_MAX_ATTEMPTS = max(1, int(os.getenv("YTDLP_MAX_ATTEMPTS", "4")))
 YTDLP_BACKOFF_BASE_SEC = max(1, int(os.getenv("YTDLP_BACKOFF_BASE_SEC", "5")))
 YTDLP_FRAGMENT_CONCURRENCY = max(1, int(os.getenv("YTDLP_FRAGMENT_CONCURRENCY", "2")))
 PLAYER_CLIENTS = [
-    c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "mweb,mediaconnect,web,ios,android").split(",")
+    c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "mweb,web,ios,android").split(",")
     if c.strip()
 ] or ["mweb"]
 
@@ -374,6 +374,7 @@ async def _run_ytdlp_warmup():
             "--force-ipv4",
             "--cache-dir", YTDLP_CACHE_DIR,
             "--js-runtimes", "node",
+            "--remote-components", "ejs:github",
             "--socket-timeout", "15",
             "--extractor-args", "youtube:player_client=mweb",
         ]
@@ -560,6 +561,7 @@ async def _download_with_ytdlp(video_id: str) -> str:
                 "--concurrent-fragments", str(YTDLP_FRAGMENT_CONCURRENCY),
                 "--cache-dir", YTDLP_CACHE_DIR,
                 "--js-runtimes", "node",
+                "--remote-components", "ejs:github",
                 "--socket-timeout", "15",
                 "--retries", "1",
                 "--extractor-args", f"youtube:player_client={player_client}",

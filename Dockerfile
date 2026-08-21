@@ -6,7 +6,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends git ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-RUN git clone --single-branch --branch 1.3.1 --depth 1 \
+RUN git clone --single-branch --branch 1.3.2 --depth 1 \
       https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /tmp/bgutil && \
     cd /tmp/bgutil/server && \
     npm ci --omit=dev --no-audit --no-fund && \
@@ -43,7 +43,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY start.sh .
 COPY supervisord.conf .
-RUN chmod +x start.sh
+RUN sed -i 's/\r$//' start.sh supervisord.conf && chmod +x start.sh
 
 # Render/Railway use PORT env var; default to 8000
 ENV PORT=8000
