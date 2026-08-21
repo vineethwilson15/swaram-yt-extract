@@ -40,7 +40,7 @@ YTDLP_MAX_ATTEMPTS = max(1, int(os.getenv("YTDLP_MAX_ATTEMPTS", "4")))
 YTDLP_BACKOFF_BASE_SEC = max(1, int(os.getenv("YTDLP_BACKOFF_BASE_SEC", "5")))
 YTDLP_FRAGMENT_CONCURRENCY = max(1, int(os.getenv("YTDLP_FRAGMENT_CONCURRENCY", "2")))
 PLAYER_CLIENTS = [
-    c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "mweb,web,ios,android").split(",")
+    c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "android_vr,mweb,web").split(",")
     if c.strip()
 ] or ["mweb"]
 
@@ -334,7 +334,7 @@ async def _run_ytdlp_warmup():
         "yt-dlp", "--no-playlist", "--simulate", "--skip-download", "--quiet",
         "--force-ipv4", "--cache-dir", YTDLP_CACHE_DIR,
         "--js-runtimes", "node", "--remote-components", "ejs:github",
-        "--socket-timeout", "15", "--extractor-args", "youtube:player_client=mweb",
+        "--socket-timeout", "15", "--extractor-args", "youtube:player_client=android_vr",
         f"https://www.youtube.com/watch?v={YTDLP_WARMUP_VIDEO_ID}",
     ]
     try:
