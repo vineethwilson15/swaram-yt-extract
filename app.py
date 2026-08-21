@@ -40,18 +40,49 @@ YTDLP_MAX_ATTEMPTS = max(1, int(os.getenv("YTDLP_MAX_ATTEMPTS", "4")))
 YTDLP_BACKOFF_BASE_SEC = max(1, int(os.getenv("YTDLP_BACKOFF_BASE_SEC", "5")))
 YTDLP_FRAGMENT_CONCURRENCY = max(1, int(os.getenv("YTDLP_FRAGMENT_CONCURRENCY", "2")))
 PLAYER_CLIENTS = [
-    c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "mweb,mediaconnect,web,ios,android").split(",")
+    c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "mweb").split(",")
     if c.strip()
 ] or ["mweb"]
 
 # Clients that must be run without cookies. They remain useful in cookie-less
-# environments and can be tried before cookie-compatible fallback clients.
+# environments (PO tokens only) and are preferred as the first fallbacks.
 _NON_COOKIE_CLIENTS = {"visionos", "android_vr", "ios", "android"}
+
+# Verified-working fallback clients (tested against yt-dlp 2026.8.19). The
+# _effective_player_clients() interleaver orders them to alternate
+# cookie-free / cookie-using clients, so the retry chain stays resilient
+# whether or not YouTube cookies are configured.
+_BUILTIN_FALLBACK_CLIENTS = [
+    "android",      # cookie-free
+    "visionos",     # cookie-free
+    "web",          # cookie-using
+    "web_safari",   # cookie-using
+    "web_embedded", # cookie-using
+    "web_music",    # cookie-using
+    "tv_simply",    # cookie-using
+]
 
 
 def _effective_player_clients() -> list[str]:
-    """Return clients in the configured order; cookies are selected per client."""
-    return PLAYER_CLIENTS or ["mweb"]
+    """Return configured clients followed by built-in fallbacks.
+
+    Fallbacks are interleaved to alternate cookie-free and cookie-using
+    clients (verified-working only), so retries stay resilient with or without
+    cookies. Cookies are selected per-client at download time.
+    """
+    base = PLAYER_CLIENTS or ["mweb"]
+    non_cookie = [c for c in _BUILTIN_FALLBACK_CLIENTS if c in _NON_COOKIE_CLIENTS]
+    cookie = [c for c in _BUILTIN_FALLBACK_CLIENTS if c not in _NON_COOKIE_CLIENTS]
+    interleaved: list[str] = []
+    i = j = 0
+    while i < len(non_cookie) or j < len(cookie):
+        if i < len(non_cookie):
+            interleaved.append(non_cookie[i])
+            i += 1
+        if j < len(cookie):
+            interleaved.append(cookie[j])
+            j += 1
+    return base + [c for c in interleaved if c not in base]
 
 # Pre-warm the EJS/nsig challenge-solver into --cache-dir at startup so a fresh
 # container (Render free tier restarts often) doesn't pay for a cold-cache
