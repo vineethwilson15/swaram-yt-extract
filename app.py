@@ -44,27 +44,14 @@ PLAYER_CLIENTS = [
     if c.strip()
 ] or ["mweb"]
 
-# Clients that do NOT support cookies. When cookies are loaded, these clients
-# are silently skipped by yt-dlp and waste a retry attempt. We keep them in
-# the default list for cookie-less operation, but dynamically reorder/exclude
-# them at request time based on cookie availability.
-_NON_COOKIE_CLIENTS = {"ios", "android"}
+# Clients that must be run without cookies. They remain useful in cookie-less
+# environments and can be tried before cookie-compatible fallback clients.
+_NON_COOKIE_CLIENTS = {"android_vr", "ios", "android"}
 
 
 def _effective_player_clients() -> list[str]:
-    """Return player clients ordered by suitability for the current cookie state.
-
-    - Cookies loaded: cookie-compatible clients first, non-cookie clients last.
-    - No cookies: default order from PLAYER_CLIENTS.
-    """
-    if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
-        compatible = [c for c in PLAYER_CLIENTS if c not in _NON_COOKIE_CLIENTS]
-        incompatible = [c for c in PLAYER_CLIENTS if c in _NON_COOKIE_CLIENTS]
-        result = compatible + incompatible
-        if not result:
-            return ["mweb"]
-        return result
-    return PLAYER_CLIENTS
+    """Return clients in the configured order; cookies are selected per client."""
+    return PLAYER_CLIENTS or ["mweb"]
 
 # Pre-warm the EJS/nsig challenge-solver into --cache-dir at startup so a fresh
 # container (Render free tier restarts often) doesn't pay for a cold-cache
@@ -320,9 +307,8 @@ def _check_bgutil_server():
 async def _warm_ytdlp_cache():
     """Kick off a background task to pre-fetch the EJS/nsig solver into --cache-dir.
 
-    Runs asynchronously — does not block startup or health checks. Tries each
-    configured proxy (or direct if none) until one succeeds, using --simulate so
-    no media is actually downloaded.
+    Runs asynchronously — does not block startup or health checks. Uses
+    --simulate so no media is actually downloaded.
     """
     if not YTDLP_WARMUP_ENABLED:
         return
@@ -345,10 +331,9 @@ async def _run_ytdlp_warmup():
         if proc.returncode == 0:
             logger.info("[warmup] EJS solver cache primed")
             return
-        logger.warning(f"[warmup] attempt failed: {stderr.decode(errors='replace')[-300:]}")
+        logger.info("[warmup] EJS cache was not primed; extraction will continue on demand")
     except Exception as e:
-        logger.warning(f"[warmup] attempt errored: {e}")
-    logger.warning("[warmup] could not prime EJS solver cache — first real request may hit a cold-cache failure")
+        logger.info(f"[warmup] skipped: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -505,12 +490,18 @@ async def _download_with_ytdlp(video_id: str) -> str:
                 "--force-overwrites",
             ]
             # PO tokens: bgutil plugin auto-discovers HTTP server on localhost:4416
-            # Cookies: optional fallback (set YT_COOKIES_B64 env var if needed)
-            if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
+            # android_vr does not support cookies; compatible clients use them
+            # as a fallback when the cookie-free attempt cannot extract media.
+            use_cookies = (
+                YT_COOKIES_FILE
+                and os.path.exists(YT_COOKIES_FILE)
+                and player_client not in _NON_COOKIE_CLIENTS
+            )
+            if use_cookies:
                 cmd.extend(["--cookies", YT_COOKIES_FILE])
                 logger.info("[yt-dlp] Using PO tokens + cookies (fallback)")
             else:
-                logger.info("[yt-dlp] Using PO tokens only (no cookies)")
+                logger.info(f"[yt-dlp] Using PO tokens only (client={player_client}, no cookies)")
             cmd.append(f"https://www.youtube.com/watch?v={video_id}")
 
             proc = await asyncio.create_subprocess_exec(
