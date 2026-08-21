@@ -66,32 +66,11 @@ def _effective_player_clients() -> list[str]:
         return result
     return PLAYER_CLIENTS
 
-# Optional proxy(ies) for yt-dlp requests (residential/rotating proxy recommended).
-# Mitigates IP-level 429 throttling from YouTube that cookies/PO tokens cannot fix.
-# Accepts one or more comma-separated proxy URLs:
-#   YTDLP_PROXY_URL=http://user:pass@host1:port,http://user:pass@host2:port
-# Format per entry: http://user:pass@host:port or socks5://host:port. No-op if unset.
-PROXY_URLS = [
-    p.strip() for p in os.getenv("YTDLP_PROXY_URL", "").split(",")
-    if p.strip()
-]
-
 # Pre-warm the EJS/nsig challenge-solver into --cache-dir at startup so a fresh
 # container (Render free tier restarts often) doesn't pay for a cold-cache
 # component fetch (and possible failure) on the first real user request.
 YTDLP_WARMUP_ENABLED = os.getenv("YTDLP_WARMUP_ENABLED", "false").strip().lower() not in ("false", "0", "no")
 YTDLP_WARMUP_VIDEO_ID = os.getenv("YTDLP_WARMUP_VIDEO_ID", "jNQXAC9IVRw")
-# Cap how many proxies the warmup task will cycle through — it only needs ONE
-# success to prime the nsig cache, so trying all configured proxies on every
-# cold start just burns proxy bandwidth quota for no extra benefit.
-YTDLP_WARMUP_MAX_PROXIES = max(1, int(os.getenv("YTDLP_WARMUP_MAX_PROXIES", "2")))
-
-# Try a direct (no-proxy) connection on the first attempt before falling back
-# to the proxy rotation. Proxy bandwidth (esp. free tiers) is a limited/costly
-# resource — the audio download itself is the expensive part. If YouTube's
-# IP-level block on this host isn't 100% consistent, this avoids spending any
-# proxy quota at all on requests that would have succeeded directly anyway.
-YTDLP_TRY_DIRECT_FIRST = os.getenv("YTDLP_TRY_DIRECT_FIRST", "false").strip().lower() not in ("false", "0", "no")
 
 # API key shared with HF Spaces backend (set via environment variable)
 API_KEY = os.getenv("API_KEY", "")
@@ -320,15 +299,6 @@ def _init_cookies():
         logger.error(f"Failed to decode YT_COOKIES_B64: {e}")
 
 
-@app.on_event("startup")
-def _log_proxy_status():
-    """Log whether yt-dlp proxies are configured (without leaking credentials)."""
-    if PROXY_URLS:
-        logger.info(f"yt-dlp proxy rotation enabled ({len(PROXY_URLS)} proxies configured)")
-    else:
-        logger.info("YTDLP_PROXY_URL not set — requests go direct from this host's IP")
-
-
 BGUTIL_SERVER_URL = "http://127.0.0.1:4416"
 
 
@@ -360,41 +330,24 @@ async def _warm_ytdlp_cache():
 
 
 async def _run_ytdlp_warmup():
-    proxy_candidates = (
-        random.sample(PROXY_URLS, k=min(len(PROXY_URLS), YTDLP_WARMUP_MAX_PROXIES))
-        if PROXY_URLS else [None]
-    )
-    for proxy_url in proxy_candidates:
-        cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "--simulate",
-            "--skip-download",
-            "--quiet",
-            "--force-ipv4",
-            "--cache-dir", YTDLP_CACHE_DIR,
-            "--js-runtimes", "node",
-            "--remote-components", "ejs:github",
-            "--socket-timeout", "15",
-            "--extractor-args", "youtube:player_client=mweb",
-        ]
-        if proxy_url:
-            cmd.extend(["--proxy", proxy_url])
-        cmd.append(f"https://www.youtube.com/watch?v={YTDLP_WARMUP_VIDEO_ID}")
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
-            if proc.returncode == 0:
-                logger.info(f"[warmup] EJS solver cache primed (proxy={_mask_proxy(proxy_url)})")
-                return
-            logger.warning(
-                f"[warmup] attempt failed (proxy={_mask_proxy(proxy_url)}): "
-                f"{stderr.decode(errors='replace')[-300:]}"
-            )
-        except Exception as e:
-            logger.warning(f"[warmup] attempt errored (proxy={_mask_proxy(proxy_url)}): {e}")
+    cmd = [
+        "yt-dlp", "--no-playlist", "--simulate", "--skip-download", "--quiet",
+        "--force-ipv4", "--cache-dir", YTDLP_CACHE_DIR,
+        "--js-runtimes", "node", "--remote-components", "ejs:github",
+        "--socket-timeout", "15", "--extractor-args", "youtube:player_client=mweb",
+        f"https://www.youtube.com/watch?v={YTDLP_WARMUP_VIDEO_ID}",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+        if proc.returncode == 0:
+            logger.info("[warmup] EJS solver cache primed")
+            return
+        logger.warning(f"[warmup] attempt failed: {stderr.decode(errors='replace')[-300:]}")
+    except Exception as e:
+        logger.warning(f"[warmup] attempt errored: {e}")
     logger.warning("[warmup] could not prime EJS solver cache — first real request may hit a cold-cache failure")
 
 
@@ -522,33 +475,16 @@ async def _download_with_ytdlp(video_id: str) -> str:
     """Download audio from YouTube using yt-dlp. Returns path to temp file."""
     last_error: Exception | None = None
 
-    # Shuffle proxies once per request so each retry attempt tries a different
-    # one (up to the number available) instead of repeating a failed proxy.
-    # If YTDLP_TRY_DIRECT_FIRST is on, the first attempt is reserved for a
-    # direct (no-proxy) connection, so only remaining attempts need a proxy.
-    direct_first = YTDLP_TRY_DIRECT_FIRST and bool(PROXY_URLS)
-    proxy_attempt_budget = max(0, YTDLP_MAX_ATTEMPTS - 1) if direct_first else YTDLP_MAX_ATTEMPTS
-    proxy_sequence = (
-        random.sample(PROXY_URLS, k=min(len(PROXY_URLS), proxy_attempt_budget))
-        if PROXY_URLS and proxy_attempt_budget else []
-    )
-
     for attempt in range(1, YTDLP_MAX_ATTEMPTS + 1):
         tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False, dir=YTDLP_FILE_CACHE_DIR)
         tmp.close()
         proc = None
         effective_clients = _effective_player_clients()
         player_client = effective_clients[(attempt - 1) % len(effective_clients)]
-        if direct_first and attempt == 1:
-            proxy_url = None  # try direct first to avoid spending proxy bandwidth quota
-        else:
-            proxy_idx = (attempt - 2) if direct_first else (attempt - 1)
-            proxy_url = proxy_sequence[proxy_idx % len(proxy_sequence)] if proxy_sequence else None
-
         try:
             logger.info(
                 f"[yt-dlp] Extracting audio for {video_id} (attempt {attempt}/{YTDLP_MAX_ATTEMPTS}, "
-                f"client={player_client}, proxy={_mask_proxy(proxy_url)})..."
+                f"client={player_client}, direct connection)..."
             )
             t0 = time.time()
 
@@ -575,10 +511,6 @@ async def _download_with_ytdlp(video_id: str) -> str:
                 logger.info("[yt-dlp] Using PO tokens + cookies (fallback)")
             else:
                 logger.info("[yt-dlp] Using PO tokens only (no cookies)")
-            # Proxy: routes yt-dlp traffic through a rotating proxy to avoid
-            # IP-level 429 throttling on this host's outbound IP.
-            if proxy_url:
-                cmd.extend(["--proxy", proxy_url])
             cmd.append(f"https://www.youtube.com/watch?v={video_id}")
 
             proc = await asyncio.create_subprocess_exec(
@@ -664,17 +596,6 @@ async def _download_with_ytdlp(video_id: str) -> str:
     raise ValueError("yt-dlp failed with no captured error")
 
 
-def _mask_proxy(proxy_url: str | None) -> str:
-    """Return a credential-free representation of a proxy URL for logging."""
-    if not proxy_url:
-        return "none"
-    if "@" in proxy_url:
-        scheme_part, host_part = proxy_url.split("@", 1)
-        scheme = scheme_part.split("://", 1)[0] if "://" in scheme_part else "proxy"
-        return f"{scheme}://***@{host_part}"
-    return proxy_url
-
-
 def _is_retryable_error(err: Exception) -> bool:
     """Return True when error likely came from temporary upstream throttling/challenge issues."""
     if isinstance(err, HTTPException):
@@ -695,10 +616,6 @@ def _is_retryable_error(err: Exception) -> bool:
         "network is unreachable",
         "failed to establish a new connection",
     ]
-    # 403 during media download is usually an IP/geo block; retry only if we have
-    # proxies configured, otherwise retrying is pointless.
-    if PROXY_URLS and "http error 403" in msg:
-        return True
     return any(sig in msg for sig in retryable_signatures)
 
 
