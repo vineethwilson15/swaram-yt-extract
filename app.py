@@ -39,10 +39,13 @@ MAX_CONCURRENT_EXTRACTS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTS", "1")))
 YTDLP_MAX_ATTEMPTS = max(1, int(os.getenv("YTDLP_MAX_ATTEMPTS", "4")))
 YTDLP_BACKOFF_BASE_SEC = max(1, int(os.getenv("YTDLP_BACKOFF_BASE_SEC", "5")))
 YTDLP_FRAGMENT_CONCURRENCY = max(1, int(os.getenv("YTDLP_FRAGMENT_CONCURRENCY", "2")))
+YTDLP_FORMAT = os.getenv(
+    "YTDLP_FORMAT", "bestaudio[abr<=96]/worstaudio/bestaudio"
+)
 PLAYER_CLIENTS = [
-    c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "mweb").split(",")
+    c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "web,mweb").split(",")
     if c.strip()
-] or ["mweb"]
+] or ["web", "mweb"]
 
 # Clients that must be run without cookies. They remain useful in cookie-less
 # environments (PO tokens only) and are preferred as the first fallbacks.
@@ -70,7 +73,7 @@ def _effective_player_clients() -> list[str]:
     clients (verified-working only), so retries stay resilient with or without
     cookies. Cookies are selected per-client at download time.
     """
-    base = PLAYER_CLIENTS or ["mweb"]
+    base = PLAYER_CLIENTS or ["web", "mweb"]
     non_cookie = [c for c in _BUILTIN_FALLBACK_CLIENTS if c in _NON_COOKIE_CLIENTS]
     cookie = [c for c in _BUILTIN_FALLBACK_CLIENTS if c not in _NON_COOKIE_CLIENTS]
     interleaved: list[str] = []
@@ -514,7 +517,7 @@ async def _download_with_ytdlp(video_id: str) -> str:
             cmd = [
                 "yt-dlp",
                 "--no-playlist",
-                "-f", "ba/b*",                     # Audio-only first, then any format
+                "-f", YTDLP_FORMAT,
                 "-S", "+size,+br,proto:m3u8_native:m3u8:https",  # Smallest + prefer m3u8 (~6MB) over https (~30MB)
                 "--force-ipv4",
                 "--concurrent-fragments", str(YTDLP_FRAGMENT_CONCURRENCY),
