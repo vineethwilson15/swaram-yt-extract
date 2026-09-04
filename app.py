@@ -40,7 +40,7 @@ YTDLP_MAX_ATTEMPTS = max(1, int(os.getenv("YTDLP_MAX_ATTEMPTS", "4")))
 YTDLP_BACKOFF_BASE_SEC = max(1, int(os.getenv("YTDLP_BACKOFF_BASE_SEC", "5")))
 YTDLP_FRAGMENT_CONCURRENCY = max(1, int(os.getenv("YTDLP_FRAGMENT_CONCURRENCY", "2")))
 YTDLP_FORMAT = os.getenv(
-    "YTDLP_FORMAT", "bestaudio[abr<=96]/worstaudio/bestaudio"
+    "YTDLP_FORMAT", "ba/b*"
 )
 PLAYER_CLIENTS = [
     c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "web,mweb").split(",")
