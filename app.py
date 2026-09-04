@@ -106,6 +106,10 @@ YTDLP_FILE_CACHE_DIR = os.getenv("YTDLP_FILE_CACHE_DIR", os.path.join(YTDLP_CACH
 # Set YT_COOKIES_B64 env var to base64-encoded Netscape cookies.txt content
 # ONLY if PO tokens alone are insufficient (rare).
 YT_COOKIES_FILE = None  # Set at startup if cookies are available
+_cookies_configured = bool(os.getenv("YT_COOKIES_B64", "").strip())
+YTDLP_USE_COOKIES = os.getenv(
+    "YTDLP_USE_COOKIES", "true" if _cookies_configured else "false"
+).strip().lower() in ("true", "1", "yes")
 
 # ---------------------------------------------------------------------------
 # Server-side LRU cache for extracted audio files
@@ -300,6 +304,9 @@ async def _start_cache_cleanup():
 def _init_cookies():
     """Decode YT_COOKIES_B64 env var to a cookies.txt file on startup (optional fallback)."""
     global YT_COOKIES_FILE
+    if not YTDLP_USE_COOKIES:
+        logger.info("YouTube cookies disabled — using PO tokens and cookie-free clients")
+        return
     cookies_b64 = os.getenv("YT_COOKIES_B64", "")
     if not cookies_b64:
         logger.info("YT_COOKIES_B64 not set — using PO tokens only (no cookie fallback)")
@@ -403,7 +410,7 @@ async def health():
         "status": "ok",
         "version": VERSION,
         "po_token_server": pot_status,
-        "cookies_loaded": YT_COOKIES_FILE is not None,
+        "cookies_loaded": YT_COOKIES_FILE is not None and YTDLP_USE_COOKIES,
     }
 
 
@@ -524,6 +531,8 @@ async def _download_with_ytdlp(video_id: str) -> str:
             # android_vr does not support cookies; compatible clients use them
             # as a fallback when the cookie-free attempt cannot extract media.
             use_cookies = (
+                YTDLP_USE_COOKIES
+                and
                 YT_COOKIES_FILE
                 and os.path.exists(YT_COOKIES_FILE)
                 and player_client not in _NON_COOKIE_CLIENTS
