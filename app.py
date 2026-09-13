@@ -4,8 +4,8 @@ Swaram YouTube Audio Extraction Microservice
 Lightweight FastAPI service that extracts audio from YouTube videos using yt-dlp.
 Designed to run on free platforms (Render, etc.) where youtube.com is accessible.
 
-Authentication: PO Tokens (via bgutil HTTP server on localhost:4416) eliminate the
-need for manual cookie rotation. Cookies are kept as optional fallback only.
+Authentication: Cookies are preferred when configured; PO Tokens (via bgutil HTTP
+server on localhost:4416) provide the fallback for cloud IP extraction.
 
 Called by the main chord-service on HF Spaces when Piped proxy fails.
 """
@@ -31,6 +31,7 @@ MAX_FILE_SIZE = 50 * 1024 * 1024       # 50 MB
 MAX_DURATION_SEC = 600                   # 10 min
 DOWNLOAD_TIMEOUT = 120                   # seconds (includes PO token generation)
 MIN_AUDIO_BYTES = 10_000                 # 10 KB
+MAX_AUDIO_BITRATE = 128                  # Prefer compact audio output (kbps)
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 # API key shared with HF Spaces backend (required environment variable)
@@ -41,8 +42,8 @@ if not API_KEY:
 # yt-dlp cache directory — stores nsig cache, EJS solver, etc.
 YTDLP_CACHE_DIR = "/app/.ytdlp-cache"
 
-# YouTube cookies — optional fallback for cloud IP extraction.
-# PO tokens (via bgutil server on localhost:4416) are the primary auth method.
+# YouTube cookies — preferred authentication for cloud IP extraction.
+# PO tokens (via bgutil server on localhost:4416) are the fallback method.
 # Set YT_COOKIES_B64 env var to base64-encoded Netscape cookies.txt content
 # ONLY if PO tokens alone are insufficient (rare).
 YT_COOKIES_FILE = None  # Set at startup if cookies are available
@@ -75,7 +76,7 @@ def _init_cookies():
     global YT_COOKIES_FILE
     cookies_b64 = os.getenv("YT_COOKIES_B64", "")
     if not cookies_b64:
-        logger.info("YT_COOKIES_B64 not set — using PO tokens only (no cookie fallback)")
+        logger.info("YT_COOKIES_B64 not set — using PO tokens only")
         return
     try:
         cookies_bytes = base64.b64decode(cookies_b64)
@@ -160,8 +161,8 @@ async def extract_audio(video_id: str):
 
     Security:
         - Only accepts validated 11-char video IDs (no arbitrary URL injection)
-        - Optional API key auth via X-API-Key header
-        - Max duration 10 min, max file size 30 MB
+        - Required API key auth via X-API-Key header
+        - Max duration 10 min, max file size 50 MB
     """
     # Validate video ID (SSRF protection — only IDs, never URLs)
     if not video_id or not YT_VIDEO_ID_RE.match(video_id):
@@ -211,11 +212,12 @@ async def _download_with_ytdlp(video_id: str) -> str:
         logger.info(f"[yt-dlp] Extracting audio for {video_id}...")
         t0 = time.time()
 
-        cmd = [
+        base_cmd = [
             "yt-dlp",
             "--no-playlist",
-            "-f", "ba/b*",                     # Audio-only first, then any format
-            "-S", "+size,+br,proto:m3u8_native:m3u8:https",  # Smallest + prefer m3u8 (~6MB) over https (~30MB)
+            "-f", f"ba[abr<={MAX_AUDIO_BITRATE}]/ba[abr<=160]/ba",
+            "--match-filter", f"duration <= {MAX_DURATION_SEC}",
+            "-S", "+size,+br,proto:m3u8_native:m3u8:https",
             "--concurrent-fragments", "4",      # Parallel HLS segment downloads
             "--cache-dir", YTDLP_CACHE_DIR,
             "--js-runtimes", "node",
@@ -223,45 +225,47 @@ async def _download_with_ytdlp(video_id: str) -> str:
             "--socket-timeout", "15",
             "--retries", "1",
             "--extractor-args", "youtube:player_client=mweb",  # mweb works best with PO tokens
-            "-o", tmp.name,
             "--force-overwrites",
         ]
-        # PO tokens: bgutil plugin auto-discovers HTTP server on localhost:4416
-        # Cookies: optional fallback (set YT_COOKIES_B64 env var if needed)
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        attempts = []
         if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
-            cmd.extend(["--cookies", YT_COOKIES_FILE])
-            logger.info("[yt-dlp] Using PO tokens + cookies (fallback)")
-        else:
-            logger.info("[yt-dlp] Using PO tokens only (no cookies)")
-        cmd.append(f"https://www.youtube.com/watch?v={video_id}")
+            attempts.append((base_cmd + ["--cookies", YT_COOKIES_FILE, video_url], "cookies"))
+        attempts.append((base_cmd + [video_url], "PO tokens"))
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        proc = None
+        full_err = ""
+        for attempt_index, (cmd, auth_mode) in enumerate(attempts):
+            cmd.extend(["-o", tmp.name])
+            logger.info(f"[yt-dlp] Trying {auth_mode} extraction")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=DOWNLOAD_TIMEOUT
-        )
-
-        elapsed = time.time() - t0
-
-        # Log which format yt-dlp selected (from stderr [info] line)
-        for line in stderr.decode(errors="replace").split("\n"):
-            if "[info]" in line and "format" in line.lower():
-                logger.info(f"[yt-dlp] {line.strip()}")
-
-        # Check yt-dlp exit status
-        if proc.returncode != 0:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=DOWNLOAD_TIMEOUT
+            )
             full_err = stderr.decode(errors="replace")
-            # Extract actual error/warning lines (skip verbose debug noise)
+
+            for line in full_err.split("\n"):
+                if "[info]" in line and "format" in line.lower():
+                    logger.info(f"[yt-dlp] {line.strip()}")
+
+            if proc.returncode == 0:
+                break
+
             err_lines = [l for l in full_err.split("\n")
                          if l.startswith("ERROR:") or l.startswith("WARNING:") or "Sign in" in l]
             err_msg = "\n".join(err_lines)[:1000] if err_lines else full_err[-500:]
-            logger.warning(f"[yt-dlp] Failed (exit {proc.returncode}): {err_msg}")
-
-            # Detect specific YouTube errors
+            logger.warning(f"[yt-dlp] {auth_mode} attempt failed (exit {proc.returncode}): {err_msg}")
+            if attempt_index < len(attempts) - 1:
+                _safe_unlink(tmp.name)
+                tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
+                tmp.close()
+                logger.info("[yt-dlp] Retrying with PO tokens")
+        else:
             if "Sign in to confirm" in full_err or "confirm you're not a bot" in full_err.lower():
                 raise HTTPException(503, "YouTube requires login — try again later")
             if "Video unavailable" in full_err:
@@ -270,6 +274,8 @@ async def _download_with_ytdlp(video_id: str) -> str:
                 raise HTTPException(403, "This video is private")
 
             raise ValueError(f"yt-dlp exit {proc.returncode}: {err_msg[:500]}")
+
+        elapsed = time.time() - t0
 
         # Validate output file
         if not os.path.exists(tmp.name):
