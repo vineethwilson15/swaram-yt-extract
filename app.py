@@ -11,6 +11,7 @@ Called by the main chord-service on HF Spaces when Piped proxy fails.
 """
 
 import os
+import glob
 import re
 import asyncio
 import tempfile
@@ -31,7 +32,7 @@ MAX_FILE_SIZE = 50 * 1024 * 1024       # 50 MB
 MAX_DURATION_SEC = 600                   # 10 min
 DOWNLOAD_TIMEOUT = 120                   # seconds (includes PO token generation)
 MIN_AUDIO_BYTES = 10_000                 # 10 KB
-MAX_AUDIO_BITRATE = 128                  # Prefer compact audio output (kbps)
+MAX_AUDIO_BITRATE = 160                  # Balance chord accuracy and transfer size (kbps)
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 # API key shared with HF Spaces backend (required environment variable)
@@ -205,8 +206,11 @@ async def extract_audio(video_id: str):
 # ---------------------------------------------------------------------------
 async def _download_with_ytdlp(video_id: str) -> str:
     """Download audio from YouTube using yt-dlp. Returns path to temp file."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
-    tmp.close()
+    output_handle = tempfile.NamedTemporaryFile(prefix="yt_audio_", delete=False)
+    output_base = output_handle.name
+    output_handle.close()
+    _safe_unlink(output_base)
+    output_template = f"{output_base}.%(ext)s"
 
     try:
         logger.info(f"[yt-dlp] Extracting audio for {video_id}...")
@@ -215,9 +219,9 @@ async def _download_with_ytdlp(video_id: str) -> str:
         base_cmd = [
             "yt-dlp",
             "--no-playlist",
-            "-f", f"ba[abr<={MAX_AUDIO_BITRATE}]/ba[abr<=160]/ba",
+            "-f", f"ba[abr<={MAX_AUDIO_BITRATE}]/ba",
             "--match-filter", f"duration <= {MAX_DURATION_SEC}",
-            "-S", "+size,+br,proto:m3u8_native:m3u8:https",
+            "-S", "abr,br,size,proto:m3u8_native:m3u8:https",
             "--concurrent-fragments", "4",      # Parallel HLS segment downloads
             "--cache-dir", YTDLP_CACHE_DIR,
             "--js-runtimes", "node",
@@ -256,7 +260,9 @@ async def _download_with_ytdlp(video_id: str) -> str:
         proc = None
         full_err = ""
         for attempt_index, (cmd, auth_mode) in enumerate(attempts):
-            cmd.extend(["-o", tmp.name])
+            for previous_output in glob.glob(f"{output_base}.*"):
+                _safe_unlink(previous_output)
+            cmd.extend(["-o", output_template])
             logger.info(f"[yt-dlp] Trying {auth_mode} extraction")
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -281,9 +287,6 @@ async def _download_with_ytdlp(video_id: str) -> str:
             err_msg = "\n".join(err_lines)[:1000] if err_lines else full_err[-500:]
             logger.warning(f"[yt-dlp] {auth_mode} attempt failed (exit {proc.returncode}): {err_msg}")
             if attempt_index < len(attempts) - 1:
-                _safe_unlink(tmp.name)
-                tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
-                tmp.close()
                 next_auth_mode = attempts[attempt_index + 1][1]
                 logger.info(f"[yt-dlp] Retrying with {next_auth_mode}")
         else:
@@ -299,17 +302,19 @@ async def _download_with_ytdlp(video_id: str) -> str:
         elapsed = time.time() - t0
 
         # Validate output file
-        if not os.path.exists(tmp.name):
+        output_files = [path for path in glob.glob(f"{output_base}.*") if os.path.isfile(path)]
+        if len(output_files) != 1:
             raise ValueError("Downloaded file not found")
+        output_path = output_files[0]
 
-        file_size = os.path.getsize(tmp.name)
+        file_size = os.path.getsize(output_path)
         if file_size < MIN_AUDIO_BYTES:
             raise ValueError(f"File too small ({file_size} bytes)")
         if file_size > MAX_FILE_SIZE:
             raise ValueError(f"File too large ({file_size} bytes)")
 
         logger.info(f"[yt-dlp] Success: {file_size/1024/1024:.1f} MB in {elapsed:.1f}s")
-        return tmp.name
+        return output_path
 
     except asyncio.TimeoutError:
         logger.warning(f"[yt-dlp] Timed out after {DOWNLOAD_TIMEOUT}s")
@@ -317,13 +322,16 @@ async def _download_with_ytdlp(video_id: str) -> str:
             proc.kill()
         except Exception:
             pass
-        _safe_unlink(tmp.name)
+        for output_file in glob.glob(f"{output_base}.*"):
+            _safe_unlink(output_file)
         raise HTTPException(504, "Download timed out — video may be too long")
     except (HTTPException, ValueError):
-        _safe_unlink(tmp.name)
+        for output_file in glob.glob(f"{output_base}.*"):
+            _safe_unlink(output_file)
         raise
     except Exception as e:
-        _safe_unlink(tmp.name)
+        for output_file in glob.glob(f"{output_base}.*"):
+            _safe_unlink(output_file)
         raise ValueError(f"Unexpected error: {e}")
 
 
