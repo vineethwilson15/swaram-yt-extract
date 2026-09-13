@@ -224,14 +224,26 @@ async def _download_with_ytdlp(video_id: str) -> str:
             "--remote-components", "ejs:github",
             "--socket-timeout", "15",
             "--retries", "1",
-            "--extractor-args", "youtube:player_client=mweb",  # mweb works best with PO tokens
             "--force-overwrites",
         ]
         video_url = f"https://www.youtube.com/watch?v={video_id}"
         attempts = []
         if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
-            attempts.append((base_cmd + ["--cookies", YT_COOKIES_FILE, video_url], "cookies"))
-        attempts.append((base_cmd + [video_url], "PO tokens"))
+            attempts.append((
+                base_cmd + [
+                    "--extractor-args", "youtube:player_client=tv",
+                    "--cookies", YT_COOKIES_FILE,
+                    video_url,
+                ],
+                "cookies (tv client)",
+            ))
+        attempts.append((
+            base_cmd + [
+                "--extractor-args", "youtube:player_client=mweb",
+                video_url,
+            ],
+            "PO tokens (mweb client)",
+        ))
 
         proc = None
         full_err = ""
