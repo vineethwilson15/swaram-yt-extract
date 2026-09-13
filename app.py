@@ -290,6 +290,11 @@ async def _download_with_ytdlp(video_id: str) -> str:
                 next_auth_mode = attempts[attempt_index + 1][1]
                 logger.info(f"[yt-dlp] Retrying with {next_auth_mode}")
         else:
+            if "HTTP Error 403" in full_err or "403: Forbidden" in full_err:
+                raise HTTPException(
+                    503,
+                    "YouTube rejected the configured cookies or service IP; refresh YT_COOKIES_B64",
+                )
             if "Sign in to confirm" in full_err or "confirm you're not a bot" in full_err.lower():
                 raise HTTPException(503, "YouTube requires login — try again later")
             if "Video unavailable" in full_err:
