@@ -32,7 +32,7 @@ MAX_FILE_SIZE = 50 * 1024 * 1024       # 50 MB
 MAX_DURATION_SEC = 600                   # 10 min
 DOWNLOAD_TIMEOUT = 120                   # seconds (includes PO token generation)
 MIN_AUDIO_BYTES = 10_000                 # 10 KB
-MAX_AUDIO_BITRATE = 160                  # Balance chord accuracy and transfer size (kbps)
+MAX_AUDIO_BITRATE = 96                   # Compact audio that remains suitable for BTC chords (kbps)
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 # API key shared with HF Spaces backend (required environment variable)
@@ -221,7 +221,7 @@ async def _download_with_ytdlp(video_id: str) -> str:
             "--no-playlist",
             "-f", f"ba[abr<={MAX_AUDIO_BITRATE}]/ba",
             "--match-filter", f"duration <= {MAX_DURATION_SEC}",
-            "-S", "abr,br,size,proto:m3u8_native:m3u8:https",
+            "-S", "+size,+br,proto:m3u8_native:m3u8:https",
             "--concurrent-fragments", "4",      # Parallel HLS segment downloads
             "--cache-dir", YTDLP_CACHE_DIR,
             "--js-runtimes", "node",
