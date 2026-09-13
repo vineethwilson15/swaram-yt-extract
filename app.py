@@ -231,11 +231,19 @@ async def _download_with_ytdlp(video_id: str) -> str:
         if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
             attempts.append((
                 base_cmd + [
-                    "--extractor-args", "youtube:player_client=tv",
+                    "--extractor-args", "youtube:player_client=web_creator",
                     "--cookies", YT_COOKIES_FILE,
                     video_url,
                 ],
-                "cookies (tv client)",
+                "cookies (web_creator client)",
+            ))
+            attempts.append((
+                base_cmd + [
+                    "--extractor-args", "youtube:player_client=mweb",
+                    "--cookies", YT_COOKIES_FILE,
+                    video_url,
+                ],
+                "cookies + PO tokens (mweb client)",
             ))
         attempts.append((
             base_cmd + [
@@ -276,7 +284,8 @@ async def _download_with_ytdlp(video_id: str) -> str:
                 _safe_unlink(tmp.name)
                 tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
                 tmp.close()
-                logger.info("[yt-dlp] Retrying with PO tokens")
+                next_auth_mode = attempts[attempt_index + 1][1]
+                logger.info(f"[yt-dlp] Retrying with {next_auth_mode}")
         else:
             if "Sign in to confirm" in full_err or "confirm you're not a bot" in full_err.lower():
                 raise HTTPException(503, "YouTube requires login — try again later")
