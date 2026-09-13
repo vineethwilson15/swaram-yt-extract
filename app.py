@@ -33,8 +33,10 @@ DOWNLOAD_TIMEOUT = 120                   # seconds (includes PO token generation
 MIN_AUDIO_BYTES = 10_000                 # 10 KB
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
-# API key shared with HF Spaces backend (set via environment variable)
-API_KEY = os.getenv("API_KEY", "")
+# API key shared with HF Spaces backend (required environment variable)
+API_KEY = os.getenv("API_KEY", "").strip()
+if not API_KEY:
+    raise RuntimeError("API_KEY environment variable is required")
 
 # yt-dlp cache directory — stores nsig cache, EJS solver, etc.
 YTDLP_CACHE_DIR = "/app/.ytdlp-cache"
@@ -109,8 +111,8 @@ def _check_bgutil_server():
 # Auth
 # ---------------------------------------------------------------------------
 async def verify_api_key(x_api_key: str = Header(None)):
-    """Verify API key if one is configured."""
-    if API_KEY and x_api_key != API_KEY:
+    """Verify the required API key."""
+    if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
