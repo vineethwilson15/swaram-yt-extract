@@ -40,14 +40,6 @@ export default {
       });
     }
 
-    if (isPublicBrowserRequest && env.TURNSTILE_SECRET) {
-      const turnstileToken = request.headers.get("CF-Turnstile-Response");
-      if (!await verifyTurnstile(turnstileToken, clientIp, env.TURNSTILE_SECRET)) {
-        console.warn("[extract] turnstile verification failed", { requestId });
-        return json({ error: "Browser verification required" }, 403, request, env);
-      }
-    }
-
     const videoId = url.searchParams.get("video_id") || "";
     if (!VIDEO_ID_RE.test(videoId)) {
       console.warn("[extract] invalid video id", { requestId });
@@ -170,7 +162,7 @@ function isAllowedOrigin(request, env) {
 function corsHeaders(request, env) {
   const origin = request.headers.get("Origin");
   const headers = {
-    "Access-Control-Allow-Headers": "X-API-Key, CF-Turnstile-Response, Content-Type",
+    "Access-Control-Allow-Headers": "X-API-Key, Content-Type",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
     "Vary": "Origin",
   };
@@ -192,24 +184,6 @@ function allowRequest(clientIp, env) {
   if (bucket.count >= limit) return false;
   bucket.count += 1;
   return true;
-}
-
-async function verifyTurnstile(token, clientIp, secret) {
-  if (!token) return false;
-  try {
-    const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ secret, response: token, remoteip: clientIp }),
-    });
-    const result = await response.json();
-    return response.ok && result.success === true;
-  } catch (error) {
-    console.error("[extract] turnstile request failed", {
-      errorType: error?.constructor?.name || "UnknownError",
-    });
-    return false;
-  }
 }
 
 function json(body, status = 200, request = null, env = {}, extraHeaders = {}) {

@@ -12,14 +12,12 @@ From this directory:
 npm install
 npx wrangler login
 npx wrangler secret put API_KEY
-npx wrangler secret put TURNSTILE_SECRET
 npm run deploy
 ```
 
 `API_KEY` remains available for trusted server-to-server callers. Browser requests
 from the configured frontend origin use public mode and do not expose `API_KEY`.
-`TURNSTILE_SECRET` is optional, but recommended for production browser traffic.
-Do not put either secret in `wrangler.toml`.
+Do not put the API key in `wrangler.toml`.
 
 ## Local development
 
@@ -35,7 +33,6 @@ The local Worker listens on the URL Wrangler prints. Test it with:
 GET /health
 GET /extract?video_id=VIDEO_ID
 X-API-Key: change-me                 # trusted backend mode
-CF-Turnstile-Response: token         # public mode when Turnstile is enabled
 ```
 
 ## Configuration
