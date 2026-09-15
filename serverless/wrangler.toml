@@ -5,3 +5,7 @@ compatibility_date = "2026-09-15"
 [vars]
 MAX_AUDIO_BITRATE = "96000"
 MAX_AUDIO_BYTES = "52428800"
+
+[observability.logs]
+enabled = false
+invocation_logs = true
