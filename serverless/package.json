@@ -8,7 +8,7 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "youtubei.js": "16.0.1"
+    "youtubei.js": "^18.0.0"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"
