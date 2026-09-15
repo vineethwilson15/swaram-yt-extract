@@ -1,0 +1,18 @@
+{
+  "tasks": {
+    "dev": "deno run --allow-all --watch main.ts",
+    "check": "deno check main.ts"
+  },
+  "compilerOptions": {
+    "strict": true
+  },
+  "deploy": {
+    "org": "vineethwilson15",
+    "app": "swaram-yt-extract"
+  }
+}
+
+
+
+
+

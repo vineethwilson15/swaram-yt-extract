@@ -2,6 +2,19 @@
   "functions": {
     "api/extract.js": {
       "maxDuration": 10
+    },
+    "api/health.js": {
+      "maxDuration": 10
     }
-  }
+  },
+  "rewrites": [
+    {
+      "source": "/health",
+      "destination": "/api/health"
+    },
+    {
+      "source": "/extract",
+      "destination": "/api/extract"
+    }
+  ]
 }

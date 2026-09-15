@@ -44,6 +44,7 @@ From this directory, install the Vercel CLI or run it through `npx`:
 npx vercel login
 npx vercel link
 npx vercel env add PUBLIC_FRONTEND_ORIGIN production
+npx vercel env add YOUTUBE_COOKIE production
 npx vercel env add API_KEY production
 npx vercel env add PUBLIC_ACCESS production
 npx vercel env add MAX_AUDIO_BITRATE production
@@ -56,6 +57,16 @@ The extraction endpoint is `/api/extract?video_id=VIDEO_ID`. Set
 `PUBLIC_ACCESS` to `true` for the configured GitHub Pages origin. Vercel uses the
 Node implementation in `api/extract.js`, which enables player retrieval because
 it is not subject to the Cloudflare Worker CPU limit.
+
+`YOUTUBE_COOKIE` is optional, but may be required for age-restricted, region-
+restricted, or consent-gated videos. It accepts the raw YouTube `Cookie` header
+value. The Vercel function also accepts `YT_COOKIES_B64`, which is a base64-
+encoded Netscape cookie export such as the one produced by `yt-dlp`. If both are
+set, `YOUTUBE_COOKIE` takes precedence. Keep either value as a Vercel
+environment variable; never commit it, put it in `vercel.json`, or expose it to
+the browser. Vercel uses the Android InnerTube client by default to avoid the
+browser interstitial response; set `YOUTUBE_CLIENT_TYPE` to `WEB` only when
+needed for a specific account or video.
 
 ## Configuration
 

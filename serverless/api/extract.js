@@ -115,9 +115,47 @@ async function handleRequest(request, env) {
 
 async function getYoutubeClient() {
   if (!youtubeClientPromise) {
-    youtubeClientPromise = Innertube.create({ retrieve_player: true });
+    youtubeClientPromise = Innertube.create({
+      cookie: youtubeCookieFromEnvironment(),
+      client_type: process.env.YOUTUBE_CLIENT_TYPE || "ANDROID",
+      retrieve_player: true,
+    });
   }
   return youtubeClientPromise;
+}
+
+function youtubeCookieFromEnvironment() {
+  if (process.env.YOUTUBE_COOKIE) return process.env.YOUTUBE_COOKIE;
+  if (!process.env.YT_COOKIES_B64) return undefined;
+
+  try {
+    const netscapeCookies = Buffer.from(process.env.YT_COOKIES_B64, "base64").toString("utf8");
+    const cookies = new Map();
+
+    for (const line of netscapeCookies.split(/\r?\n/)) {
+      if (!line || line.startsWith("#")) continue;
+      const fields = line.split("\t");
+      if (fields.length < 7 || !fields[5] || fields[6] === undefined) continue;
+      if (!isGoogleOrYouTubeCookieDomain(fields[0])) continue;
+      cookies.set(fields[5], fields[6]);
+    }
+
+    const cookieHeader = [...cookies.entries()]
+      .map(([name, value]) => `${name}=${value}`)
+      .join("; ");
+    return cookieHeader || undefined;
+  } catch (error) {
+    console.warn("[extract] invalid YT_COOKIES_B64 value", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+}
+
+function isGoogleOrYouTubeCookieDomain(domain) {
+  const normalized = domain.toLowerCase().replace(/^\./, "");
+  return normalized === "google.com" || normalized.endsWith(".google.com")
+    || normalized === "youtube.com" || normalized.endsWith(".youtube.com");
 }
 
 function selectAudioFormat(formats, maxBitrate, maxBytes) {
