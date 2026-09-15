@@ -8,6 +8,8 @@ let youtubeClientPromise;
 
 export default {
   async fetch(request, env) {
+    const startedAt = Date.now();
+    const requestId = request.headers.get("cf-ray") || crypto.randomUUID();
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
@@ -22,11 +24,13 @@ export default {
     }
 
     if (!env.API_KEY || request.headers.get("X-API-Key") !== env.API_KEY) {
+      console.warn("[extract] unauthorized", { requestId });
       return json({ error: "Invalid API key" }, 401);
     }
 
     const videoId = url.searchParams.get("video_id") || "";
     if (!VIDEO_ID_RE.test(videoId)) {
+      console.warn("[extract] invalid video id", { requestId });
       return json({ error: "Invalid video_id - must be 11 alphanumeric chars" }, 400);
     }
 
@@ -34,16 +38,38 @@ export default {
     const maxBytes = positiveInteger(env.MAX_AUDIO_BYTES, DEFAULT_MAX_AUDIO_BYTES);
 
     try {
+      console.log("[extract] youtube lookup started", { requestId, videoId });
       const youtube = await getYoutubeClient();
       const info = await youtube.getBasicInfo(videoId);
       const audioFormat = selectAudioFormat(info.streaming_data?.adaptive_formats, maxBitrate, maxBytes);
 
       if (!audioFormat?.url) {
+        console.warn("[extract] no audio format", {
+          requestId,
+          videoId,
+          formatCount: info.streaming_data?.adaptive_formats?.length || 0,
+          elapsedMs: Date.now() - startedAt,
+        });
         return json({ error: "No direct audio stream is available" }, 404);
       }
 
+      console.log("[extract] audio format selected", {
+        requestId,
+        videoId,
+        mimeType: audioFormat.mime_type || "",
+        bitrate: audioFormat.bitrate || audioFormat.average_bitrate || 0,
+        contentLength: audioFormat.content_length || "unknown",
+        elapsedMs: Date.now() - startedAt,
+      });
+
       const audioResponse = await fetch(audioFormat.url);
       if (!audioResponse.ok || !audioResponse.body) {
+        console.warn("[extract] audio stream failed", {
+          requestId,
+          videoId,
+          status: audioResponse.status,
+          elapsedMs: Date.now() - startedAt,
+        });
         return json({ error: "Audio stream could not be fetched" }, 502);
       }
 
@@ -54,9 +80,22 @@ export default {
         headers.set("Content-Length", String(audioFormat.content_length));
       }
 
+      console.log("[extract] success", {
+        requestId,
+        videoId,
+        status: 200,
+        elapsedMs: Date.now() - startedAt,
+      });
+
       return new Response(audioResponse.body, { status: 200, headers });
     } catch (error) {
-      console.error("YouTube extraction failed", error);
+      console.error("[extract] YouTube extraction failed", {
+        requestId,
+        videoId,
+        errorType: error?.constructor?.name || "UnknownError",
+        error: error instanceof Error ? error.message : String(error),
+        elapsedMs: Date.now() - startedAt,
+      });
       return json({ error: "YouTube extraction failed" }, 502);
     }
   },
