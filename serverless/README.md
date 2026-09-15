@@ -12,10 +12,14 @@ From this directory:
 npm install
 npx wrangler login
 npx wrangler secret put API_KEY
+npx wrangler secret put TURNSTILE_SECRET
 npm run deploy
 ```
 
-The API key is stored as a Worker secret. Do not put it in `wrangler.toml`.
+`API_KEY` remains available for trusted server-to-server callers. Browser requests
+from the configured frontend origin use public mode and do not expose `API_KEY`.
+`TURNSTILE_SECRET` is optional, but recommended for production browser traffic.
+Do not put either secret in `wrangler.toml`.
 
 ## Local development
 
@@ -30,12 +34,19 @@ The local Worker listens on the URL Wrangler prints. Test it with:
 ```text
 GET /health
 GET /extract?video_id=VIDEO_ID
-X-API-Key: change-me
+X-API-Key: change-me                 # trusted backend mode
+CF-Turnstile-Response: token         # public mode when Turnstile is enabled
 ```
 
 ## Configuration
 
-`wrangler.toml` sets a preferred maximum audio bitrate of 96 kbps and a 50 MB maximum stream size. These values can be overridden with Worker variables named `MAX_AUDIO_BITRATE` and `MAX_AUDIO_BYTES`.
+`wrangler.toml` configures a preferred maximum audio bitrate of 96 kbps, a 50 MB
+maximum stream size, the GitHub Pages origin, and three extraction requests per
+IP per minute. `PUBLIC_ACCESS` enables browser requests only when the `Origin`
+header exactly matches `PUBLIC_FRONTEND_ORIGIN`.
+
+Cloudflare Worker memory is not a durable rate-limit store. For stronger abuse
+protection, also configure a Cloudflare WAF/rate-limiting rule for `/extract`.
 
 ## Important limitations
 
