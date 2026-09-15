@@ -35,6 +35,28 @@ GET /extract?video_id=VIDEO_ID
 X-API-Key: change-me                 # trusted backend mode
 ```
 
+## Vercel deployment
+
+The same serverless extractor can run as a Vercel Node function without Docker.
+From this directory, install the Vercel CLI or run it through `npx`:
+
+```powershell
+npx vercel login
+npx vercel link
+npx vercel env add PUBLIC_FRONTEND_ORIGIN production
+npx vercel env add API_KEY production
+npx vercel env add PUBLIC_ACCESS production
+npx vercel env add MAX_AUDIO_BITRATE production
+npx vercel env add MAX_AUDIO_BYTES production
+npx vercel env add REQUESTS_PER_MINUTE production
+npm run deploy:vercel
+```
+
+The extraction endpoint is `/api/extract?video_id=VIDEO_ID`. Set
+`PUBLIC_ACCESS` to `true` for the configured GitHub Pages origin. Vercel uses the
+Node implementation in `api/extract.js`, which enables player retrieval because
+it is not subject to the Cloudflare Worker CPU limit.
+
 ## Configuration
 
 `wrangler.toml` configures a preferred maximum audio bitrate of 96 kbps, a 50 MB
