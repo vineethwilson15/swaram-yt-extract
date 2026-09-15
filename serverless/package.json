@@ -12,6 +12,7 @@
     "youtubei.js": "^18.0.0"
   },
   "devDependencies": {
+    "vercel": "^59.17.0",
     "wrangler": "^4.0.0"
   }
 }
