@@ -51,7 +51,7 @@ export default {
 
     try {
       console.log("[extract] youtube lookup started", { requestId, videoId });
-      const youtube = await getYoutubeClient();
+      const youtube = await getYoutubeClient(env);
       const info = await youtube.getBasicInfo(videoId);
       const audioFormat = selectAudioFormat(info.streaming_data?.adaptive_formats, maxBitrate, maxBytes);
 
@@ -115,9 +115,11 @@ export default {
   },
 };
 
-async function getYoutubeClient() {
+async function getYoutubeClient(env) {
   if (!youtubeClientPromise) {
-    youtubeClientPromise = Innertube.create({ retrieve_player: true });
+    youtubeClientPromise = Innertube.create({
+      retrieve_player: env.RETRIEVE_PLAYER === "true",
+    });
   }
   return youtubeClientPromise;
 }

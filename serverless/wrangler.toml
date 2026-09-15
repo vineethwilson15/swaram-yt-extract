@@ -7,6 +7,7 @@ MAX_AUDIO_BITRATE = "96000"
 MAX_AUDIO_BYTES = "52428800"
 PUBLIC_ACCESS = "true"
 PUBLIC_FRONTEND_ORIGIN = "https://ecoliving-tips.github.io"
+RETRIEVE_PLAYER = "false"
 REQUESTS_PER_MINUTE = "3"
 
 [observability.logs]
