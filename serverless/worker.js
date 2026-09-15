@@ -1,4 +1,4 @@
-import { Innertube } from "youtubei.js";
+import { Innertube } from "youtubei.js/cf-worker";
 
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 const DEFAULT_MAX_AUDIO_BITRATE = 96_000;
@@ -117,7 +117,7 @@ export default {
 
 async function getYoutubeClient() {
   if (!youtubeClientPromise) {
-    youtubeClientPromise = Innertube.create();
+    youtubeClientPromise = Innertube.create({ retrieve_player: true });
   }
   return youtubeClientPromise;
 }
