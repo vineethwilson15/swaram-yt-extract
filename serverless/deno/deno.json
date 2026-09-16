@@ -5,14 +5,5 @@
   },
   "compilerOptions": {
     "strict": true
-  },
-  "deploy": {
-    "org": "vineethwilson15",
-    "app": "swaram-yt-extract"
   }
 }
-
-
-
-
-
