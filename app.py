@@ -34,8 +34,8 @@ MAX_DURATION_SEC = 600                   # 10 min
 DOWNLOAD_TIMEOUT = 120                   # seconds (includes PO token generation)
 MIN_AUDIO_BYTES = 10_000                 # 10 KB
 MAX_AUDIO_BITRATE = 96                   # Compact audio that remains suitable for BTC chords (kbps)
-MAX_CONCURRENT_EXTRACTIONS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "1")))
-CONCURRENT_FRAGMENTS = max(1, int(os.getenv("YT_CONCURRENT_FRAGMENTS", "2")))
+MAX_CONCURRENT_EXTRACTIONS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "2")))
+CONCURRENT_FRAGMENTS = max(1, int(os.getenv("YT_CONCURRENT_FRAGMENTS", "4")))
 FORMAT_SORT = os.getenv("YT_FORMAT_SORT", "+size,+br,proto:https:m3u8_native:m3u8")
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
