@@ -40,6 +40,7 @@ FORMAT_SORT = os.getenv("YT_FORMAT_SORT", "+size,+br,proto:https:m3u8_native:m3u
 PRIMARY_PLAYER_CLIENT = os.getenv("YT_PRIMARY_CLIENT", "web_creator").strip()
 SKIP_MANIFESTS = os.getenv("YT_SKIP_MANIFESTS", "1").strip().lower() not in {"0", "false", "no"}
 CHECK_FORMATS = os.getenv("YT_CHECK_FORMATS", "0").strip().lower() in {"1", "true", "yes"}
+EXTRACTOR_RETRIES = max(1, int(os.getenv("YT_EXTRACTOR_RETRIES", "1")))
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 # API key shared with HF Spaces backend (required environment variable)
@@ -251,7 +252,6 @@ async def _download_with_ytdlp_limited(video_id: str) -> str:
 
 async def _download_with_ytdlp_process(video_id: str) -> str:
     """Run one yt-dlp subprocess and return its completed output path."""
-    """Run one yt-dlp extraction while the caller holds an extraction slot."""
     output_handle = tempfile.NamedTemporaryFile(prefix="yt_audio_", delete=False)
     output_base = output_handle.name
     output_handle.close()
@@ -275,10 +275,11 @@ async def _download_with_ytdlp_process(video_id: str) -> str:
             "--remote-components", "ejs:github",
             "--socket-timeout", "15",
             "--retries", "1",
+            "--extractor-retries", str(EXTRACTOR_RETRIES),
             "--force-overwrites",
         ]
         if SKIP_MANIFESTS:
-            base_cmd.extend(["--extractor-args", "youtube:skip=hls,dash"])
+            base_cmd.extend(["--extractor-args", "youtube:skip=hls,dash,translated_subs"])
         if not CHECK_FORMATS:
             base_cmd.append("--no-check-formats")
         video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -358,6 +359,11 @@ async def _download_with_ytdlp_process(video_id: str) -> str:
                          if l.startswith("ERROR:") or l.startswith("WARNING:") or "Sign in" in l]
             err_msg = "\n".join(err_lines)[:1000] if err_lines else full_err[-500:]
             logger.warning(f"[yt-dlp] {auth_mode} attempt failed (exit {proc.returncode}): {err_msg}")
+            if "HTTP Error 429" in full_err or "Too Many Requests" in full_err:
+                raise HTTPException(
+                    503,
+                    "YouTube is temporarily rate-limiting this service; retry later",
+                )
             if attempt_index < len(attempts) - 1:
                 next_auth_mode = attempts[attempt_index + 1][1]
                 logger.info(f"[yt-dlp] Retrying with {next_auth_mode}")
