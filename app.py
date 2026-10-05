@@ -36,6 +36,7 @@ MIN_AUDIO_BYTES = 10_000                 # 10 KB
 MAX_AUDIO_BITRATE = 96                   # Compact audio that remains suitable for BTC chords (kbps)
 MAX_CONCURRENT_EXTRACTIONS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "2")))
 CONCURRENT_FRAGMENTS = max(1, int(os.getenv("YT_CONCURRENT_FRAGMENTS", "4")))
+FORMAT_SORT = os.getenv("YT_FORMAT_SORT", "+size,+br,proto:https:m3u8_native:m3u8")
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 # API key shared with HF Spaces backend (required environment variable)
@@ -266,7 +267,8 @@ async def _download_with_ytdlp_limited(video_id: str) -> str:
             "--no-playlist",
             "-f", f"ba[abr<={MAX_AUDIO_BITRATE}]/ba",
             "--match-filter", f"duration <= {MAX_DURATION_SEC}",
-            "-S", "+size,+br,proto:m3u8_native:m3u8:https",
+            "-S", FORMAT_SORT,
+            "--print", "[yt-dlp] selected format=%(format_id)s protocol=%(protocol)s codec=%(acodec)s abr=%(abr)s",
             "--concurrent-fragments", str(CONCURRENT_FRAGMENTS),
             "--cache-dir", YTDLP_CACHE_DIR,
             "--js-runtimes", "node",
@@ -320,6 +322,12 @@ async def _download_with_ytdlp_limited(video_id: str) -> str:
                 proc.communicate(), timeout=DOWNLOAD_TIMEOUT
             )
             full_err = stderr.decode(errors="replace")
+            format_lines = [
+                line.strip() for line in stdout.decode(errors="replace").splitlines()
+                if line.strip().startswith("[yt-dlp] selected format=")
+            ]
+            for line in format_lines:
+                logger.info(line)
             attempt_elapsed = time.perf_counter() - attempt_started
             logger.info(
                 f"[yt-dlp] {auth_mode} attempt {attempt_index + 1}/{len(attempts)} "
