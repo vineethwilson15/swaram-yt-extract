@@ -33,6 +33,8 @@ MAX_DURATION_SEC = 600                   # 10 min
 DOWNLOAD_TIMEOUT = 120                   # seconds (includes PO token generation)
 MIN_AUDIO_BYTES = 10_000                 # 10 KB
 MAX_AUDIO_BITRATE = 96                   # Compact audio that remains suitable for BTC chords (kbps)
+MAX_CONCURRENT_EXTRACTIONS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "2")))
+CONCURRENT_FRAGMENTS = max(1, int(os.getenv("YT_CONCURRENT_FRAGMENTS", "4")))
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 # API key shared with HF Spaces backend (required environment variable)
@@ -69,6 +71,7 @@ app.add_middleware(
 
 # Track temp files for cleanup
 _active_files: set[str] = set()
+_extraction_slots = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
 
 
 @app.on_event("startup")
@@ -206,6 +209,18 @@ async def extract_audio(video_id: str):
 # ---------------------------------------------------------------------------
 async def _download_with_ytdlp(video_id: str) -> str:
     """Download audio from YouTube using yt-dlp. Returns path to temp file."""
+    wait_started = time.perf_counter()
+    async with _extraction_slots:
+        queue_time = time.perf_counter() - wait_started
+        if queue_time >= 0.1:
+            logger.info(
+                f"[yt-dlp] {video_id} waited {queue_time:.2f}s for an extraction slot"
+            )
+        return await _download_with_ytdlp_limited(video_id)
+
+
+async def _download_with_ytdlp_limited(video_id: str) -> str:
+    """Run one yt-dlp extraction while the caller holds an extraction slot."""
     output_handle = tempfile.NamedTemporaryFile(prefix="yt_audio_", delete=False)
     output_base = output_handle.name
     output_handle.close()
@@ -214,7 +229,7 @@ async def _download_with_ytdlp(video_id: str) -> str:
 
     try:
         logger.info(f"[yt-dlp] Extracting audio for {video_id}...")
-        t0 = time.time()
+        t0 = time.perf_counter()
 
         base_cmd = [
             "yt-dlp",
@@ -222,7 +237,7 @@ async def _download_with_ytdlp(video_id: str) -> str:
             "-f", f"ba[abr<={MAX_AUDIO_BITRATE}]/ba",
             "--match-filter", f"duration <= {MAX_DURATION_SEC}",
             "-S", "+size,+br,proto:m3u8_native:m3u8:https",
-            "--concurrent-fragments", "4",      # Parallel HLS segment downloads
+            "--concurrent-fragments", str(CONCURRENT_FRAGMENTS),
             "--cache-dir", YTDLP_CACHE_DIR,
             "--js-runtimes", "node",
             "--remote-components", "ejs:github",
@@ -260,6 +275,7 @@ async def _download_with_ytdlp(video_id: str) -> str:
         proc = None
         full_err = ""
         for attempt_index, (cmd, auth_mode) in enumerate(attempts):
+            attempt_started = time.perf_counter()
             for previous_output in glob.glob(f"{output_base}.*"):
                 _safe_unlink(previous_output)
             cmd.extend(["-o", output_template])
@@ -274,6 +290,11 @@ async def _download_with_ytdlp(video_id: str) -> str:
                 proc.communicate(), timeout=DOWNLOAD_TIMEOUT
             )
             full_err = stderr.decode(errors="replace")
+            attempt_elapsed = time.perf_counter() - attempt_started
+            logger.info(
+                f"[yt-dlp] {auth_mode} attempt {attempt_index + 1}/{len(attempts)} "
+                f"finished in {attempt_elapsed:.2f}s (exit {proc.returncode})"
+            )
 
             for line in full_err.split("\n"):
                 if "[info]" in line and "format" in line.lower():
@@ -304,7 +325,7 @@ async def _download_with_ytdlp(video_id: str) -> str:
 
             raise ValueError(f"yt-dlp exit {proc.returncode}: {err_msg[:500]}")
 
-        elapsed = time.time() - t0
+        elapsed = time.perf_counter() - t0
 
         # Validate output file
         output_files = [path for path in glob.glob(f"{output_base}.*") if os.path.isfile(path)]
