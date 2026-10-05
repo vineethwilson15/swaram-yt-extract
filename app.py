@@ -14,6 +14,7 @@ import os
 import glob
 import re
 import asyncio
+import shutil
 import tempfile
 import logging
 import time
@@ -72,6 +73,8 @@ app.add_middleware(
 # Track temp files for cleanup
 _active_files: set[str] = set()
 _extraction_slots = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
+_inflight_downloads: dict[str, asyncio.Task[str]] = {}
+_inflight_waiters: dict[str, int] = {}
 
 
 @app.on_event("startup")
@@ -208,7 +211,30 @@ async def extract_audio(video_id: str):
 # yt-dlp extraction
 # ---------------------------------------------------------------------------
 async def _download_with_ytdlp(video_id: str) -> str:
-    """Download audio from YouTube using yt-dlp. Returns path to temp file."""
+    """Coalesce concurrent requests, returning a private response file to each caller."""
+    task = _inflight_downloads.get(video_id)
+    if task is None:
+        task = asyncio.create_task(_download_with_ytdlp_limited(video_id))
+        _inflight_downloads[video_id] = task
+        _inflight_waiters[video_id] = 0
+    else:
+        logger.info(f"[yt-dlp] Joining in-flight extraction for {video_id}")
+
+    _inflight_waiters[video_id] += 1
+    try:
+        source_path = await asyncio.shield(task)
+        return _copy_for_response(source_path)
+    finally:
+        _inflight_waiters[video_id] -= 1
+        if _inflight_waiters[video_id] == 0:
+            _inflight_downloads.pop(video_id, None)
+            _inflight_waiters.pop(video_id, None)
+            if task.done() and not task.cancelled() and task.exception() is None:
+                _safe_unlink(task.result())
+
+
+async def _download_with_ytdlp_limited(video_id: str) -> str:
+    """Run one yt-dlp extraction while the caller holds an extraction slot."""
     wait_started = time.perf_counter()
     async with _extraction_slots:
         queue_time = time.perf_counter() - wait_started
@@ -216,7 +242,11 @@ async def _download_with_ytdlp(video_id: str) -> str:
             logger.info(
                 f"[yt-dlp] {video_id} waited {queue_time:.2f}s for an extraction slot"
             )
-        return await _download_with_ytdlp_limited(video_id)
+        return await _download_with_ytdlp_process(video_id)
+
+
+async def _download_with_ytdlp_process(video_id: str) -> str:
+    """Run one yt-dlp subprocess and return its completed output path."""
 
 
 async def _download_with_ytdlp_limited(video_id: str) -> str:
@@ -359,6 +389,22 @@ async def _download_with_ytdlp_limited(video_id: str) -> str:
         for output_file in glob.glob(f"{output_base}.*"):
             _safe_unlink(output_file)
         raise ValueError(f"Unexpected error: {e}")
+
+
+def _copy_for_response(source_path: str) -> str:
+    """Create a response-owned link so each caller can clean up independently."""
+    extension = os.path.splitext(source_path)[1]
+    response_handle = tempfile.NamedTemporaryFile(
+        prefix="yt_response_", suffix=extension, delete=False
+    )
+    response_path = response_handle.name
+    response_handle.close()
+    _safe_unlink(response_path)
+    try:
+        os.link(source_path, response_path)
+    except OSError:
+        shutil.copyfile(source_path, response_path)
+    return response_path
 
 
 # ---------------------------------------------------------------------------
