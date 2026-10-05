@@ -38,6 +38,8 @@ MAX_CONCURRENT_EXTRACTIONS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", 
 CONCURRENT_FRAGMENTS = max(1, int(os.getenv("YT_CONCURRENT_FRAGMENTS", "4")))
 FORMAT_SORT = os.getenv("YT_FORMAT_SORT", "+size,+br,proto:https:m3u8_native:m3u8")
 PRIMARY_PLAYER_CLIENT = os.getenv("YT_PRIMARY_CLIENT", "web_creator").strip()
+SKIP_MANIFESTS = os.getenv("YT_SKIP_MANIFESTS", "1").strip().lower() not in {"0", "false", "no"}
+CHECK_FORMATS = os.getenv("YT_CHECK_FORMATS", "0").strip().lower() in {"1", "true", "yes"}
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 # API key shared with HF Spaces backend (required environment variable)
@@ -275,6 +277,10 @@ async def _download_with_ytdlp_process(video_id: str) -> str:
             "--retries", "1",
             "--force-overwrites",
         ]
+        if SKIP_MANIFESTS:
+            base_cmd.extend(["--extractor-args", "youtube:skip=hls,dash"])
+        if not CHECK_FORMATS:
+            base_cmd.append("--no-check-formats")
         video_url = f"https://www.youtube.com/watch?v={video_id}"
         attempts = []
         supported_clients = {"web_creator", "web_safari", "mweb"}
