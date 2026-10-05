@@ -37,6 +37,7 @@ MAX_AUDIO_BITRATE = 96                   # Compact audio that remains suitable f
 MAX_CONCURRENT_EXTRACTIONS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "2")))
 CONCURRENT_FRAGMENTS = max(1, int(os.getenv("YT_CONCURRENT_FRAGMENTS", "4")))
 FORMAT_SORT = os.getenv("YT_FORMAT_SORT", "+size,+br,proto:https:m3u8_native:m3u8")
+PRIMARY_PLAYER_CLIENT = os.getenv("YT_PRIMARY_CLIENT", "web_creator").strip()
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 # API key shared with HF Spaces backend (required environment variable)
@@ -276,15 +277,30 @@ async def _download_with_ytdlp_process(video_id: str) -> str:
         ]
         video_url = f"https://www.youtube.com/watch?v={video_id}"
         attempts = []
+        supported_clients = {"web_creator", "web_safari", "mweb"}
+        primary_client = (
+            PRIMARY_PLAYER_CLIENT
+            if PRIMARY_PLAYER_CLIENT in supported_clients
+            else "web_creator"
+        )
         if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
             attempts.append((
                 base_cmd + [
-                    "--extractor-args", "youtube:player_client=web_creator",
+                    "--extractor-args", f"youtube:player_client={primary_client}",
                     "--cookies", YT_COOKIES_FILE,
                     video_url,
                 ],
-                "cookies (web_creator client)",
+                f"cookies ({primary_client} client)",
             ))
+            if primary_client != "web_creator":
+                attempts.append((
+                    base_cmd + [
+                        "--extractor-args", "youtube:player_client=web_creator",
+                        "--cookies", YT_COOKIES_FILE,
+                        video_url,
+                    ],
+                    "cookies (web_creator client)",
+                ))
             attempts.append((
                 base_cmd + [
                     "--extractor-args", "youtube:player_client=mweb",
