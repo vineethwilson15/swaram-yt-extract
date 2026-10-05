@@ -39,7 +39,7 @@ CONCURRENT_FRAGMENTS = max(1, int(os.getenv("YT_CONCURRENT_FRAGMENTS", "4")))
 FORMAT_SORT = os.getenv("YT_FORMAT_SORT", "+size,+br,proto:https:m3u8_native:m3u8")
 PRIMARY_PLAYER_CLIENT = os.getenv("YT_PRIMARY_CLIENT", "web_creator").strip()
 SKIP_MANIFESTS = os.getenv("YT_SKIP_MANIFESTS", "1").strip().lower() not in {"0", "false", "no"}
-CHECK_FORMATS = os.getenv("YT_CHECK_FORMATS", "0").strip().lower() in {"1", "true", "yes"}
+CHECK_FORMATS = os.getenv("YT_CHECK_FORMATS", "1").strip().lower() in {"1", "true", "yes"}
 EXTRACTOR_RETRIES = max(1, int(os.getenv("YT_EXTRACTOR_RETRIES", "1")))
 YT_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
