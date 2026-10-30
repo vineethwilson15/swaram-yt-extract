@@ -22,7 +22,7 @@ import base64
 import urllib.request
 import urllib.error
 from fastapi import FastAPI, HTTPException, Depends, Header
-from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,6 @@ _active_files: set[str] = set()
 _extraction_slots = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
 _inflight_downloads: dict[str, asyncio.Task[str]] = {}
 _inflight_waiters: dict[str, int] = {}
-_inflight_resolutions: dict[str, asyncio.Task[str]] = {}
 
 
 @app.on_event("startup")
@@ -179,13 +178,12 @@ async def health():
 
 
 @app.get("/extract", dependencies=[Depends(verify_api_key)])
-async def extract_audio(video_id: str, delivery: str = "binary"):
+async def extract_audio(video_id: str):
     """
     Extract audio from a YouTube video and return the file.
 
     Query params:
         video_id: 11-character YouTube video ID (SSRF-safe: no arbitrary URLs)
-        delivery: binary (default) or redirect to YouTube's temporary audio URL
 
     Returns:
         Audio file (M4A/WebM) as streaming download
@@ -198,14 +196,8 @@ async def extract_audio(video_id: str, delivery: str = "binary"):
     # Validate video ID (SSRF protection — only IDs, never URLs)
     if not video_id or not YT_VIDEO_ID_RE.match(video_id):
         raise HTTPException(400, "Invalid video_id — must be 11 alphanumeric chars")
-    if delivery not in {"binary", "redirect"}:
-        raise HTTPException(400, "Invalid delivery — use binary or redirect")
     if not YT_COOKIES_FILE and not await _wait_for_bgutil():
         raise HTTPException(503, "PO token server is not ready")
-
-    if delivery == "redirect":
-        audio_url = await _resolve_audio_url(video_id)
-        return RedirectResponse(audio_url, status_code=302)
 
     tmp_path = None
     try:
@@ -421,7 +413,6 @@ def _build_ytdlp_attempts(
     video_url: str,
     base_cmd: list[str],
     output_template: str | None = None,
-    resolve_only: bool = False,
 ) -> list[tuple[list[str], str]]:
     supported_clients = {
         "tv", "web_embedded", "web_creator", "android_vr",
@@ -443,10 +434,7 @@ def _build_ytdlp_attempts(
         ]
         if cookies and YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
             command.extend(["--cookies", YT_COOKIES_FILE])
-        if resolve_only:
-            command.append("--get-url")
-        else:
-            command.extend(["-o", output_template])
+        command.extend(["-o", output_template])
         command.append(video_url)
         attempts.append((command, label))
 
@@ -460,64 +448,6 @@ def _build_ytdlp_attempts(
         "PO tokens (rotating clients)",
     )
     return attempts
-
-
-async def _resolve_audio_url(video_id: str) -> str:
-    task = _inflight_resolutions.get(video_id)
-    if task is None:
-        task = asyncio.create_task(_resolve_audio_url_limited(video_id))
-        _inflight_resolutions[video_id] = task
-    else:
-        logger.info(f"[yt-dlp] Joining in-flight URL resolution for {video_id}")
-    try:
-        return await asyncio.shield(task)
-    finally:
-        if _inflight_resolutions.get(video_id) is task:
-            _inflight_resolutions.pop(video_id, None)
-
-
-async def _resolve_audio_url_limited(video_id: str) -> str:
-    async with _extraction_slots:
-        return await _resolve_audio_url_process(video_id)
-
-
-async def _resolve_audio_url_process(video_id: str) -> str:
-    """Resolve a temporary audio URL without transferring media through Render."""
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-    attempts = _build_ytdlp_attempts(video_url, _base_ytdlp_command(), resolve_only=True)
-    last_error = "yt-dlp did not return a media URL"
-    for attempt_index, (cmd, auth_mode) in enumerate(attempts):
-        logger.info(f"[yt-dlp] Resolving URL with {auth_mode}")
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_ytdlp_environment(),
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=DOWNLOAD_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            last_error = "URL resolution timed out"
-            continue
-
-        if proc.returncode == 0:
-            for line in stdout.decode(errors="replace").splitlines():
-                candidate = line.strip()
-                if candidate.startswith("https://") and ".googlevideo.com/" in candidate:
-                    return candidate
-            last_error = "yt-dlp returned no safe media URL"
-        else:
-            last_error = stderr.decode(errors="replace")[-500:]
-            if "HTTP Error 429" in last_error or "Too Many Requests" in last_error:
-                break
-        if attempt_index < len(attempts) - 1:
-            logger.warning(f"[yt-dlp] URL resolution failed with {auth_mode}; trying next client")
-
-    raise HTTPException(503, f"YouTube URL resolution failed: {last_error[:200]}")
 
 
 def _copy_for_response(source_path: str) -> str:
