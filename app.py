@@ -118,6 +118,18 @@ def _bgutil_is_reachable() -> bool:
     return True
 
 
+async def _wait_for_bgutil(timeout: float = 15.0) -> bool:
+    global BGUTIL_READY
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await asyncio.to_thread(_bgutil_is_reachable):
+            BGUTIL_READY = True
+            return True
+        await asyncio.sleep(0.5)
+    BGUTIL_READY = False
+    return False
+
+
 @app.on_event("startup")
 def _check_bgutil_server():
     """Wait briefly for bgutil before advertising the service as ready."""
@@ -187,8 +199,10 @@ async def extract_audio(video_id: str, delivery: str = "binary"):
         raise HTTPException(400, "Invalid video_id — must be 11 alphanumeric chars")
     if delivery not in {"binary", "redirect"}:
         raise HTTPException(400, "Invalid delivery — use binary or redirect")
-    if not _bgutil_is_reachable():
+    if not await _wait_for_bgutil() and not YT_COOKIES_FILE:
         raise HTTPException(503, "PO token server is not ready")
+    if not BGUTIL_READY and YT_COOKIES_FILE:
+        logger.warning("bgutil is unavailable; continuing with configured cookies")
 
     if delivery == "redirect":
         audio_url = await _resolve_audio_url(video_id)
