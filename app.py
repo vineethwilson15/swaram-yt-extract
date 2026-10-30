@@ -22,7 +22,7 @@ import base64
 import urllib.request
 import urllib.error
 from fastapi import FastAPI, HTTPException, Depends, Header
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------------------------------
@@ -34,7 +34,7 @@ MAX_DURATION_SEC = 600                   # 10 min
 DOWNLOAD_TIMEOUT = 120                   # seconds (includes PO token generation)
 MIN_AUDIO_BYTES = 10_000                 # 10 KB
 MAX_AUDIO_BITRATE = 96                   # Compact audio that remains suitable for BTC chords (kbps)
-MAX_CONCURRENT_EXTRACTIONS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "2")))
+MAX_CONCURRENT_EXTRACTIONS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "1")))
 CONCURRENT_FRAGMENTS = max(1, int(os.getenv("YT_CONCURRENT_FRAGMENTS", "2")))
 FORMAT_SORT = os.getenv("YT_FORMAT_SORT", "+size,+br,proto:https:m3u8_native:m3u8")
 PRIMARY_PLAYER_CLIENT = os.getenv("YT_PRIMARY_CLIENT", "web_creator").strip()
@@ -104,20 +104,31 @@ def _init_cookies():
 
 
 BGUTIL_SERVER_URL = "http://127.0.0.1:4416"
+BGUTIL_READY = False
+
+
+def _bgutil_is_reachable() -> bool:
+    try:
+        req = urllib.request.Request(BGUTIL_SERVER_URL, method="GET")
+        urllib.request.urlopen(req, timeout=1)
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+    return True
 
 
 @app.on_event("startup")
 def _check_bgutil_server():
-    """Log bgutil PO token server status (non-blocking — server may still be starting)."""
-    try:
-        req = urllib.request.Request(BGUTIL_SERVER_URL, method="GET")
-        urllib.request.urlopen(req, timeout=2)
-        logger.info(f"bgutil PO token server reachable on {BGUTIL_SERVER_URL}")
-    except urllib.error.HTTPError:
-        # 404 etc. means server IS running (no root route defined)
-        logger.info(f"bgutil PO token server reachable on {BGUTIL_SERVER_URL}")
-    except Exception:
-        logger.info(f"bgutil PO token server not yet reachable — supervisord will start it")
+    """Wait briefly for bgutil before advertising the service as ready."""
+    global BGUTIL_READY
+    for _ in range(20):
+        if _bgutil_is_reachable():
+            BGUTIL_READY = True
+            logger.info(f"bgutil PO token server reachable on {BGUTIL_SERVER_URL}")
+            return
+        time.sleep(0.5)
+    logger.error(f"bgutil PO token server is unreachable on {BGUTIL_SERVER_URL}")
 
 
 # ---------------------------------------------------------------------------
@@ -141,32 +152,27 @@ async def root():
 @app.get("/health")
 @app.head("/health")
 async def health():
-    # Check bgutil server reachability
-    pot_status = "unreachable"
-    try:
-        req = urllib.request.Request(BGUTIL_SERVER_URL, method="GET")
-        urllib.request.urlopen(req, timeout=2)
-        pot_status = "ok"
-    except urllib.error.HTTPError:
-        # 404 etc. means server IS running (no root route defined)
-        pot_status = "ok"
-    except Exception:
-        pass
-    return {
+    global BGUTIL_READY
+    BGUTIL_READY = _bgutil_is_reachable()
+    payload = {
         "status": "ok",
         "version": VERSION,
-        "po_token_server": pot_status,
+        "po_token_server": "ok" if BGUTIL_READY else "unreachable",
         "cookies_loaded": YT_COOKIES_FILE is not None,
     }
+    if not BGUTIL_READY:
+        return JSONResponse(payload | {"status": "degraded"}, status_code=503)
+    return payload
 
 
 @app.get("/extract", dependencies=[Depends(verify_api_key)])
-async def extract_audio(video_id: str):
+async def extract_audio(video_id: str, delivery: str = "binary"):
     """
     Extract audio from a YouTube video and return the file.
 
     Query params:
         video_id: 11-character YouTube video ID (SSRF-safe: no arbitrary URLs)
+        delivery: binary (default) or redirect to YouTube's temporary audio URL
 
     Returns:
         Audio file (M4A/WebM) as streaming download
@@ -179,6 +185,14 @@ async def extract_audio(video_id: str):
     # Validate video ID (SSRF protection — only IDs, never URLs)
     if not video_id or not YT_VIDEO_ID_RE.match(video_id):
         raise HTTPException(400, "Invalid video_id — must be 11 alphanumeric chars")
+    if delivery not in {"binary", "redirect"}:
+        raise HTTPException(400, "Invalid delivery — use binary or redirect")
+    if not _bgutil_is_reachable():
+        raise HTTPException(503, "PO token server is not ready")
+
+    if delivery == "redirect":
+        audio_url = await _resolve_audio_url(video_id)
+        return RedirectResponse(audio_url, status_code=302)
 
     tmp_path = None
     try:
@@ -262,67 +276,9 @@ async def _download_with_ytdlp_process(video_id: str) -> str:
         logger.info(f"[yt-dlp] Extracting audio for {video_id}...")
         t0 = time.perf_counter()
 
-        base_cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "--no-progress",
-            "-f", f"ba[abr<={MAX_AUDIO_BITRATE}]/ba",
-            "--match-filter", f"duration <= {MAX_DURATION_SEC}",
-            "-S", FORMAT_SORT,
-            "--concurrent-fragments", str(CONCURRENT_FRAGMENTS),
-            "--cache-dir", YTDLP_CACHE_DIR,
-            "--js-runtimes", "node",
-            "--remote-components", "ejs:github",
-            "--socket-timeout", "15",
-            "--retries", "1",
-            "--extractor-retries", str(EXTRACTOR_RETRIES),
-            "--force-overwrites",
-        ]
-        if SKIP_MANIFESTS:
-            base_cmd.extend(["--extractor-args", "youtube:skip=hls,dash,translated_subs"])
-        if not CHECK_FORMATS:
-            base_cmd.append("--no-check-formats")
+        base_cmd = _base_ytdlp_command()
         video_url = f"https://www.youtube.com/watch?v={video_id}"
-        attempts = []
-        supported_clients = {"web_creator", "web_safari", "mweb"}
-        primary_client = (
-            PRIMARY_PLAYER_CLIENT
-            if PRIMARY_PLAYER_CLIENT in supported_clients
-            else "web_creator"
-        )
-        if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
-            attempts.append((
-                base_cmd + [
-                    "--extractor-args", f"youtube:player_client={primary_client}",
-                    "--cookies", YT_COOKIES_FILE,
-                    video_url,
-                ],
-                f"cookies ({primary_client} client)",
-            ))
-            if primary_client != "web_creator":
-                attempts.append((
-                    base_cmd + [
-                        "--extractor-args", "youtube:player_client=web_creator",
-                        "--cookies", YT_COOKIES_FILE,
-                        video_url,
-                    ],
-                    "cookies (web_creator client)",
-                ))
-            attempts.append((
-                base_cmd + [
-                    "--extractor-args", "youtube:player_client=mweb",
-                    "--cookies", YT_COOKIES_FILE,
-                    video_url,
-                ],
-                "cookies + PO tokens (mweb client)",
-            ))
-        attempts.append((
-            base_cmd + [
-                "--extractor-args", "youtube:player_client=mweb",
-                video_url,
-            ],
-            "PO tokens (mweb client)",
-        ))
+        attempts = _build_ytdlp_attempts(video_url, base_cmd, output_template)
 
         proc = None
         full_err = ""
@@ -330,12 +286,12 @@ async def _download_with_ytdlp_process(video_id: str) -> str:
             attempt_started = time.perf_counter()
             for previous_output in glob.glob(f"{output_base}.*"):
                 _safe_unlink(previous_output)
-            cmd.extend(["-o", output_template])
             logger.info(f"[yt-dlp] Trying {auth_mode} extraction")
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=_ytdlp_environment(),
             )
 
             stdout, stderr = await asyncio.wait_for(
@@ -416,6 +372,120 @@ async def _download_with_ytdlp_process(video_id: str) -> str:
         for output_file in glob.glob(f"{output_base}.*"):
             _safe_unlink(output_file)
         raise ValueError(f"Unexpected error: {e}")
+
+
+def _base_ytdlp_command() -> list[str]:
+    command = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-progress",
+        "-f", f"ba[abr<={MAX_AUDIO_BITRATE}]/ba",
+        "--match-filter", f"duration <= {MAX_DURATION_SEC}",
+        "-S", FORMAT_SORT,
+        "--concurrent-fragments", str(CONCURRENT_FRAGMENTS),
+        "--cache-dir", YTDLP_CACHE_DIR,
+        "--js-runtimes", "node",
+        "--remote-components", "ejs:github",
+        "--socket-timeout", "15",
+        "--retries", "2",
+        "--fragment-retries", "1",
+        "--extractor-retries", str(EXTRACTOR_RETRIES),
+        "--force-ipv4",
+        "--force-overwrites",
+    ]
+    if not CHECK_FORMATS:
+        command.append("--no-check-formats")
+    return command
+
+
+def _ytdlp_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["YT_DLP_POT_PROVIDER_URL"] = BGUTIL_SERVER_URL
+    return environment
+
+
+def _build_ytdlp_attempts(
+    video_url: str,
+    base_cmd: list[str],
+    output_template: str | None = None,
+    resolve_only: bool = False,
+) -> list[tuple[list[str], str]]:
+    supported_clients = {
+        "tv", "web_embedded", "web_creator", "android_vr",
+        "tv_downgraded", "mweb", "web_safari",
+    }
+    primary_client = (
+        PRIMARY_PLAYER_CLIENT
+        if PRIMARY_PLAYER_CLIENT in supported_clients
+        else "web_creator"
+    )
+    attempts: list[tuple[list[str], str]] = []
+
+    def add_attempt(client_spec: str, label: str, cookies: bool = False):
+        command = base_cmd + [
+            "--extractor-args",
+            "youtube:"
+            f"player_client={client_spec};player_skip=webpage"
+            + (";skip=hls,dash,translated_subs" if SKIP_MANIFESTS else ""),
+        ]
+        if cookies and YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
+            command.extend(["--cookies", YT_COOKIES_FILE])
+        if resolve_only:
+            command.append("--get-url")
+        else:
+            command.extend(["-o", output_template])
+        command.append(video_url)
+        attempts.append((command, label))
+
+    if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
+        add_attempt(primary_client, f"cookies ({primary_client} client)", cookies=True)
+        if primary_client != "web_creator":
+            add_attempt("web_creator", "cookies (web_creator client)", cookies=True)
+        add_attempt("mweb", "cookies + PO tokens (mweb client)", cookies=True)
+    add_attempt(
+        "tv,web_embedded,web_creator,android_vr,tv_downgraded,mweb",
+        "PO tokens (rotating clients)",
+    )
+    return attempts
+
+
+async def _resolve_audio_url(video_id: str) -> str:
+    """Resolve a temporary audio URL without transferring media through Render."""
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    attempts = _build_ytdlp_attempts(video_url, _base_ytdlp_command(), resolve_only=True)
+    last_error = "yt-dlp did not return a media URL"
+    for attempt_index, (cmd, auth_mode) in enumerate(attempts):
+        logger.info(f"[yt-dlp] Resolving URL with {auth_mode}")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_ytdlp_environment(),
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=DOWNLOAD_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            last_error = "URL resolution timed out"
+            continue
+
+        if proc.returncode == 0:
+            for line in stdout.decode(errors="replace").splitlines():
+                candidate = line.strip()
+                if candidate.startswith("https://") and ".googlevideo.com/" in candidate:
+                    return candidate
+            last_error = "yt-dlp returned no safe media URL"
+        else:
+            last_error = stderr.decode(errors="replace")[-500:]
+            if "HTTP Error 429" in last_error or "Too Many Requests" in last_error:
+                break
+        if attempt_index < len(attempts) - 1:
+            logger.warning(f"[yt-dlp] URL resolution failed with {auth_mode}; trying next client")
+
+    raise HTTPException(503, f"YouTube URL resolution failed: {last_error[:200]}")
 
 
 def _copy_for_response(source_path: str) -> str:
