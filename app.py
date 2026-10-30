@@ -80,6 +80,7 @@ _active_files: set[str] = set()
 _extraction_slots = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
 _inflight_downloads: dict[str, asyncio.Task[str]] = {}
 _inflight_waiters: dict[str, int] = {}
+_inflight_resolutions: dict[str, asyncio.Task[str]] = {}
 
 
 @app.on_event("startup")
@@ -199,10 +200,8 @@ async def extract_audio(video_id: str, delivery: str = "binary"):
         raise HTTPException(400, "Invalid video_id — must be 11 alphanumeric chars")
     if delivery not in {"binary", "redirect"}:
         raise HTTPException(400, "Invalid delivery — use binary or redirect")
-    if not await _wait_for_bgutil() and not YT_COOKIES_FILE:
+    if not YT_COOKIES_FILE and not await _wait_for_bgutil():
         raise HTTPException(503, "PO token server is not ready")
-    if not BGUTIL_READY and YT_COOKIES_FILE:
-        logger.warning("bgutil is unavailable; continuing with configured cookies")
 
     if delivery == "redirect":
         audio_url = await _resolve_audio_url(video_id)
@@ -464,6 +463,25 @@ def _build_ytdlp_attempts(
 
 
 async def _resolve_audio_url(video_id: str) -> str:
+    task = _inflight_resolutions.get(video_id)
+    if task is None:
+        task = asyncio.create_task(_resolve_audio_url_limited(video_id))
+        _inflight_resolutions[video_id] = task
+    else:
+        logger.info(f"[yt-dlp] Joining in-flight URL resolution for {video_id}")
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if _inflight_resolutions.get(video_id) is task:
+            _inflight_resolutions.pop(video_id, None)
+
+
+async def _resolve_audio_url_limited(video_id: str) -> str:
+    async with _extraction_slots:
+        return await _resolve_audio_url_process(video_id)
+
+
+async def _resolve_audio_url_process(video_id: str) -> str:
     """Resolve a temporary audio URL without transferring media through Render."""
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     attempts = _build_ytdlp_attempts(video_url, _base_ytdlp_command(), resolve_only=True)
