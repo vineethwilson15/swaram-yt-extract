@@ -332,7 +332,7 @@ async def _download_with_ytdlp_process(video_id: str) -> str:
             if "HTTP Error 403" in full_err or "403: Forbidden" in full_err:
                 raise HTTPException(
                     503,
-                    "YouTube rejected the configured cookies or service IP; refresh YT_COOKIES_B64",
+                    "YouTube rejected this request (HTTP 403). Refresh YT_COOKIES_B64 if the cookies are expired; otherwise this hosting IP may be blocked. Retrying from the same host may continue to fail.",
                 )
             if "Sign in to confirm" in full_err or "confirm you're not a bot" in full_err.lower():
                 raise HTTPException(503, "YouTube requires login — try again later")
